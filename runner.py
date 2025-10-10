@@ -183,10 +183,39 @@ def health():
 def root():
     return jsonify({"ok": True, "service": "FUNCTION-RUNNER", "endpoints": ["/health", "/chat"]})
 
-@app.route("/chat", methods=["POST", "OPTIONS"])
-@require_runner_key
+@app.route("/chat", methods=["POST"])
 def chat():
+    # ── Auth gate for GPT Action ───────────────────────────────────────────
+    required_key = os.environ.get("RUNNER_ACTION_KEY", "").strip()
+    if required_key:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer " + required_key):
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    # ── Parse message ──────────────────────────────────────────────────────
     data = request.get_json(silent=True) or {}
+    if "message" in data:
+        msg = data["message"]
+    else:
+        kv = [f"{k}={json.dumps(v) if isinstance(v, str) and ' ' in v else v}"
+              for k, v in data.items()]
+        msg = " ".join(kv) if kv else "operation=get_memory user_id=phil thread_id=smoke limit=3"
+
+    # ── Execute ────────────────────────────────────────────────────────────
+    try:
+        print(">> Received:", msg, flush=True)
+        reply = run_once(msg)
+        print("<< Reply:", reply, flush=True)
+        return jsonify({"ok": True, "assistant": reply})
+    except requests.HTTPError as http_err:
+        code = getattr(http_err.response, "status_code", 500)
+        try:
+            payload = http_err.response.json()
+        except Exception:
+            payload = {"error": http_err.response.text}
+        return jsonify({"ok": False, "source": "memory_api", "code": code, **payload}), code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
     # Accept either a raw freeform message, or structured fields we turn into message
     if "message" in data and isinstance(data["message"], str):
