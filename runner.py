@@ -5,15 +5,34 @@ import shlex
 from flask import Flask, request, jsonify
 import requests
 from openai import OpenAI
+from functools import wraps
 
 # ── Env ──────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
-ASSISTANT_ID    = os.environ["ASSISTANT_ID"]  # your “Dave v1 api” Assistant ID
-MEMORY_BASE_URL = os.environ.get("MEMORY_BASE_URL", "https://dave-runner.onrender.com")
-MEMORY_API_KEY  = os.environ["MEMORY_API_KEY"]
+OPENAI_API_KEY   = os.environ["OPENAI_API_KEY"]
+ASSISTANT_ID     = os.environ["ASSISTANT_ID"]  # your “Dave v1 api” Assistant ID
+MEMORY_BASE_URL  = os.environ.get("MEMORY_BASE_URL", "https://dave-runner.onrender.com")
+MEMORY_API_KEY   = os.environ["MEMORY_API_KEY"]
+RUNNER_ACTION_KEY = os.environ["RUNNER_ACTION_KEY"]  # <-- add in Render env
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = Flask(__name__)
+
+# ── Auth helper (protect /chat) ──────────────────────────────────────────────
+def require_runner_key(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        # allow health & root without auth (and preflight)
+        if request.method == "OPTIONS" or request.path in ("/", "/health"):
+            return fn(*args, **kwargs)
+        auth = request.headers.get("Authorization", "")
+        # Expect: "Bearer <RUNNER_ACTION_KEY>"
+        if not auth.startswith("Bearer "):
+            return jsonify({"ok": False, "error": "Missing Bearer token"}), 401
+        token = auth.split(" ", 1)[1].strip()
+        if not token or token != RUNNER_ACTION_KEY:
+            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapped
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def mem_call(path: str, method: str = "GET", params=None, body=None):
@@ -36,7 +55,7 @@ def parse_message_kv(message: str) -> dict:
     for tok in shlex.split(message or ""):
         if "=" in tok:
             k, v = tok.split("=", 1)
-            args[k.strip()] = v.strip()
+            args[k.strip()] = v.strip().strip()
     return args
 
 def handle_tool_call(tc):
@@ -111,9 +130,8 @@ def run_once(user_msg: str) -> str:
         tool_choice="auto"
     )
 
-    # Wait/loop with cap
     started = time.time()
-    MAX_SECS = 45         # hard cap to stop spin
+    MAX_SECS = 45
     SLEEP_SECS = 0.6
 
     while True:
@@ -141,7 +159,6 @@ def run_once(user_msg: str) -> str:
             break
 
         if time.time() - started > MAX_SECS:
-            # stop the wait; fetch whatever messages exist
             break
 
         time.sleep(SLEEP_SECS)
@@ -166,17 +183,25 @@ def health():
 def root():
     return jsonify({"ok": True, "service": "FUNCTION-RUNNER", "endpoints": ["/health", "/chat"]})
 
-@app.route("/chat", methods=["POST"])
+@app.route("/chat", methods=["POST", "OPTIONS"])
+@require_runner_key
 def chat():
     data = request.get_json(silent=True) or {}
+
     # Accept either a raw freeform message, or structured fields we turn into message
-    if "message" in data:
+    if "message" in data and isinstance(data["message"], str):
         msg = data["message"]
     else:
         # build message if user posts JSON like {"operation": "...", "user_id": "...", ...}
-        kv = [f"{k}={json.dumps(v) if isinstance(v, str) and ' ' in v else v}"
-              for k, v in data.items()]
-        msg = " ".join(kv) if kv else "operation=get_memory user_id=phil thread_id=smoke limit=3"
+        kv_parts = []
+        for k, v in data.items():
+            if isinstance(v, str):
+                # quote strings that contain spaces
+                v_out = v if " " not in v else json.dumps(v)
+            else:
+                v_out = json.dumps(v)
+            kv_parts.append(f"{k}={v_out}")
+        msg = " ".join(kv_parts) if kv_parts else "operation=get_memory user_id=phil thread_id=smoke limit=3"
 
     try:
         print(">> Received:", msg, flush=True)
