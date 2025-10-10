@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import shlex
 from flask import Flask, request, jsonify
 import requests
 from openai import OpenAI
@@ -11,20 +12,14 @@ ASSISTANT_ID    = os.environ["ASSISTANT_ID"]  # your “Dave v1 api” Assistant
 MEMORY_BASE_URL = os.environ.get("MEMORY_BASE_URL", "https://dave-runner.onrender.com")
 MEMORY_API_KEY  = os.environ["MEMORY_API_KEY"]
 
-# OpenAI client (SDK v1.x reads key from env; passing explicitly is fine too)
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Flask app
 app = Flask(__name__)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def mem_call(path: str, method: str = "GET", params=None, body=None):
     """Call Dave Runner memory API with auth header; always return JSON or raise."""
     url = f"{MEMORY_BASE_URL}{path}"
-    headers = {
-        "X-API-KEY": MEMORY_API_KEY,
-        "Content-Type": "application/json",
-    }
+    headers = {"X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"}
     if method.upper() == "GET":
         r = requests.get(url, headers=headers, params=params or {}, timeout=20)
     else:
@@ -32,29 +27,49 @@ def mem_call(path: str, method: str = "GET", params=None, body=None):
     r.raise_for_status()
     return r.json()
 
+def parse_message_kv(message: str) -> dict:
+    """
+    Parse free-form 'key=value' pairs from a string.
+    Respects quotes using shlex (e.g., content="hello world").
+    """
+    args = {}
+    for tok in shlex.split(message or ""):
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            args[k.strip()] = v.strip()
+    return args
+
 def handle_tool_call(tc):
     """
-    Route tool/function calls from the Assistant to the memory API.
-    - Accepts either the Playground `operation` arg or the function name.
-    - Fills in reasonable defaults so Playground 'strict' doesn’t break runs.
+    Handle a tool call from the Assistant.
+    Supports either:
+      - Playground function:  function_runner(message="operation=... user_id=...")
+      - Legacy direct tools:  save_memory / get_memory / memory_bridge / recall_memory_window / reflect_and_store_memory
     """
-    name = getattr(tc.function, "name", None) or ""
-    args = json.loads(getattr(tc.function, "arguments", "") or "{}")
+    name = getattr(tc.function, "name", "") or ""
+    raw_args = json.loads(getattr(tc.function, "arguments", "") or "{}")
 
-    # Auto-fill defaults for optional keys (won’t override explicitly provided values)
+    # If the unified bridge is used, parse its 'message' string to args.
+    if name == "function_runner":
+        msg = raw_args.get("message", "")
+        args = parse_message_kv(msg)
+    else:
+        args = dict(raw_args)
+
+    # Auto-defaults (don’t override provided values)
     defaults = {
         "slide_id": "t-001",
         "glyph_echo": "🪞",
         "drift_score": 0.05,
         "seal": "lawful",
         "limit": 5,
-        "content": "(no content provided)"
+        "content": "(no content provided)",
     }
     for k, v in defaults.items():
         args.setdefault(k, v)
 
-    # Either explicit 'operation' (Playground freeform) or the tool's function name
-    operation = (args.get("operation") or name or "").strip()
+    # Operation resolution: explicit 'operation' beats name.
+    operation = (args.get("operation") or name or "").strip().lower()
 
     # ── Read routes ───────────────────────────────────────────────────────────
     if operation in ("memory_bridge", "get_memory", "recall_memory_window"):
@@ -64,30 +79,47 @@ def handle_tool_call(tc):
 
     # ── Write routes ──────────────────────────────────────────────────────────
     if operation in ("save_memory", "reflect_and_store_memory"):
-        # For reflect_and_store_memory, system prompt should have composed a summary in `content`.
-        out = mem_call("/save_memory", "POST", body=args)
+        out = mem_call("/save_memory", "POST", body={
+            "user_id":     args.get("user_id", ""),
+            "thread_id":   args.get("thread_id", ""),
+            "slide_id":    args.get("slide_id"),
+            "glyph_echo":  args.get("glyph_echo"),
+            "drift_score": float(args.get("drift_score") or 0.0),
+            "seal":        args.get("seal"),
+            "content":     args.get("content"),
+        })
         return tc.id, json.dumps(out)
 
-    # Unknown / unhandled
-    return tc.id, json.dumps({"ok": False, "error": f"unknown operation '{operation}'", "received": {"name": name, "args": args}})
+    # Unknown
+    return tc.id, json.dumps({
+        "ok": False,
+        "error": f"unknown operation '{operation}'",
+        "received": {"name": name, "args": args}
+    })
 
 def run_once(user_msg: str) -> str:
-    """Create a thread, run once with tool loop, return last assistant text."""
-    # 1) create thread + user message
+    """
+    Create a thread, run once with tool loop, return last assistant text.
+    Includes a timeout to avoid endless spins.
+    """
     th = client.beta.threads.create()
     client.beta.threads.messages.create(th.id, role="user", content=user_msg)
 
-    # 2) start run
     run = client.beta.threads.runs.create(
         thread_id=th.id,
         assistant_id=ASSISTANT_ID,
         tool_choice="auto"
     )
 
-    # 3) tool loop
+    # Wait/loop with cap
+    started = time.time()
+    MAX_SECS = 45         # hard cap to stop spin
+    SLEEP_SECS = 0.6
+
     while True:
         run = client.beta.threads.runs.retrieve(thread_id=th.id, run_id=run.id)
         status = run.status
+
         if status == "requires_action":
             calls = run.required_action.submit_tool_outputs.tool_calls
             outs = []
@@ -98,17 +130,23 @@ def run_once(user_msg: str) -> str:
                     tid = tc.id
                     output = json.dumps({"ok": False, "error": f"runner exception: {e}"})
                 outs.append({"tool_call_id": tid, "output": output})
+
             run = client.beta.threads.runs.submit_tool_outputs(
                 thread_id=th.id,
                 run_id=run.id,
                 tool_outputs=outs
             )
+
         elif status in ("completed", "failed", "cancelled", "expired"):
             break
-        else:
-            time.sleep(0.6)
 
-    # 4) return the latest assistant text
+        if time.time() - started > MAX_SECS:
+            # stop the wait; fetch whatever messages exist
+            break
+
+        time.sleep(SLEEP_SECS)
+
+    # Return the most recent assistant text
     msgs = client.beta.threads.messages.list(thread_id=th.id, order="desc").data
     for m in msgs:
         if m.role == "assistant":
@@ -131,12 +169,21 @@ def root():
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
-    msg = data.get("message") or "operation=get_memory user_id=phil thread_id=smoke limit=3"
+    # Accept either a raw freeform message, or structured fields we turn into message
+    if "message" in data:
+        msg = data["message"]
+    else:
+        # build message if user posts JSON like {"operation": "...", "user_id": "...", ...}
+        kv = [f"{k}={json.dumps(v) if isinstance(v, str) and ' ' in v else v}"
+              for k, v in data.items()]
+        msg = " ".join(kv) if kv else "operation=get_memory user_id=phil thread_id=smoke limit=3"
+
     try:
+        print(">> Received:", msg, flush=True)
         reply = run_once(msg)
+        print("<< Reply:", reply, flush=True)
         return jsonify({"ok": True, "assistant": reply})
     except requests.HTTPError as http_err:
-        # bubble up memory API errors nicely
         code = getattr(http_err.response, "status_code", 500)
         try:
             payload = http_err.response.json()
@@ -148,5 +195,4 @@ def chat():
 
 # ── Local dev ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Local only; Render uses gunicorn per Procfile
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
