@@ -185,14 +185,17 @@ def root():
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    # ── Auth gate for GPT Action ───────────────────────────────────────────
-    required_key = os.environ.get("RUNNER_ACTION_KEY", "").strip()
-    if required_key:
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer " + required_key):
-            return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    # ---- auth gate for GPT Action ----
+    required = os.environ.get("RUNNER_ACTION_KEY", "")
+    auth = request.headers.get("Authorization", "")
 
-    # ── Parse message ──────────────────────────────────────────────────────
+    if required and not auth.startswith("Bearer " + required):
+        return jsonify({
+            "ok": False,
+            "error": "Unauthorized",
+            "detail": "Missing or invalid Bearer token."
+        }), 401
+
     data = request.get_json(silent=True) or {}
     if "message" in data:
         msg = data["message"]
@@ -201,7 +204,6 @@ def chat():
               for k, v in data.items()]
         msg = " ".join(kv) if kv else "operation=get_memory user_id=phil thread_id=smoke limit=3"
 
-    # ── Execute ────────────────────────────────────────────────────────────
     try:
         print(">> Received:", msg, flush=True)
         reply = run_once(msg)
