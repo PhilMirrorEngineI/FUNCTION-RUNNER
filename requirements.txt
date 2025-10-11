@@ -1,3 +1,4 @@
 Flask==3.0.3
 gunicorn==21.2.
 openai==1.59.6
+httpx
