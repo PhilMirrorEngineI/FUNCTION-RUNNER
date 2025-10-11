@@ -1,73 +1,91 @@
-import os, time, json
+# runner.py — DavePMEi Function Runner (base64 image support)
+
+import os
+import base64
 from flask import Flask, request, jsonify
-from functools import wraps
 from openai import OpenAI
 
-OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
-ASSISTANT_ID     = os.environ.get("ASSISTANT_ID", "").strip()  # optional; ok if blank
-RUNNER_ACTION_KEY= os.environ.get("RUNNER_ACTION_KEY", "").strip()
-RUN_MAX_SECS     = int(os.environ.get("RUN_MAX_SECS", "25"))
-
+# -----------------------------
+# Setup
+# -----------------------------
 app = Flask(__name__)
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-def require_runner_key(fn):
-    @wraps(fn)
-    def w(*a, **k):
-        if request.method == "OPTIONS" or request.path in ("/", "/health"):
-            return fn(*a, **k)
-        auth = request.headers.get("Authorization", "")
-        key  = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else request.headers.get("X-API-KEY","")
-        if not key or key != RUNNER_ACTION_KEY:
-            return jsonify({"ok": False, "error": "Unauthorized"}), 401
-        return fn(*a, **k)
-    return w
-
-@app.after_request
-def cors(r):
-    r.headers["Access-Control-Allow-Origin"]  = "*"
-    r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-KEY"
-    r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return r
-
-@app.route("/")
-def root():
-    return jsonify({"ok": True, "service": "Function-Runner", "routes": ["/health","/chat"]})
-
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "ts": int(time.time())})
-
-@app.errorhandler(Exception)
-def oops(e):
-    return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.route("/chat", methods=["POST", "OPTIONS"])
-@require_runner_key
-def chat():
-    if request.method == "OPTIONS":
-        return jsonify({"ok": True})
-
-    body = request.get_json(silent=True) or {}
-    user_msg = str(body.get("message", "")).strip()
-    if not user_msg:
-        return jsonify({"ok": False, "error": "Missing 'message'"}), 400
-    if not OPENAI_API_KEY:
-        return jsonify({"ok": False, "error": "OPENAI_API_KEY not set"}), 500
-
-    # Use Completions directly (simple, reliable). You can swap to Assistants later.
+# Helper: basic text response (your existing logic can live here)
+def do_text_completion(prompt: str) -> str:
     try:
-        resp = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":"You are Dave, a concise helpful assistant."},
-                      {"role":"user","content":user_msg}],
-            temperature=0.3,
-            timeout=RUN_MAX_SECS
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
         )
-        text = (resp.choices[0].message.content or "").strip()
-        return jsonify({"ok": True, "type": "assistant_message", "content": text})
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        return jsonify({"ok": False, "error": f"OpenAI call failed: {e}"}), 502
+        return f"Error during completion: {str(e)}"
 
+# -----------------------------
+# Chat endpoint
+# -----------------------------
+@app.post("/chat")
+def chat():
+    data = request.get_json(force=True) or {}
+    msg = (data.get("message") or "").strip()
+
+    # Handle empty input
+    if not msg:
+        return jsonify({
+            "ok": False,
+            "error": "Empty message",
+            "type": "error"
+        }), 400
+
+    # Detect image request keywords
+    if msg.lower().startswith(("generate an image", "create an image", "draw", "make an image", "show me")):
+        prompt = msg
+        try:
+            # Call OpenAI Images API and return base64
+            image = client.images.generate(
+                model="gpt-image-1",
+                prompt=prompt,
+                size="1024x1024"
+            )
+            b64_image = image.data[0].b64_json
+            return jsonify({
+                "ok": True,
+                "type": "assistant_message",
+                "content": f"Here’s your image for: '{prompt}'",
+                "images": [
+                    {"b64": b64_image, "format": "png"}
+                ]
+            }), 200
+
+        except Exception as e:
+            return jsonify({
+                "ok": False,
+                "type": "error",
+                "error": f"Image generation failed: {str(e)}"
+            }), 500
+
+    # Default: text generation
+    reply_text = do_text_completion(msg)
+    return jsonify({
+        "ok": True,
+        "type": "assistant_message",
+        "content": reply_text
+    }), 200
+
+
+# -----------------------------
+# Health check
+# -----------------------------
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "status": "healthy"}), 200
+
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","8000")))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
