@@ -12,8 +12,9 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 
 # Optional: Dave memory service (same service your frontend hits)
-MEMORY_BASE = os.getenv("MEMORY_BASE_URL", "https://davepmei-ai.onrender.com")
-MEMORY_KEY  = os.getenv("MEMORY_API_KEY")
+# Accept either the new names or the old Dave_* names
+MEMORY_BASE = os.getenv("MEMORY_BASE_URL") or os.getenv("DAVE_API_BASE")
+MEMORY_KEY  = os.getenv("MEMORY_API_KEY")  or os.getenv("DAVE_API_KEY")
 SAVE_REPLIES = os.getenv("SAVE_REPLIES", "true").lower() == "true"
 
 # ---------- Dave Memory helpers ----------
