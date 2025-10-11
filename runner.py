@@ -171,37 +171,61 @@ def do_pdf(title: str, body: str) -> dict:
 # ---------- routes ----------
 @app.post("/chat")
 def chat():
-    data = request.get_json(force=True) or {}
-    msg = (data.get("message") or "").strip()
-    user_email = (data.get("userEmail") or data.get("email") or "").strip()
+    try:
+        data = request.get_json(force=True) or {}
+        msg = (data.get("message") or "").strip()
+        user_email = (data.get("userEmail") or data.get("email") or "").strip()
 
-    if not msg:
-        return jsonify({"ok": False, "type": "error", "error": "Empty message"}), 400
+        if not msg:
+            return jsonify({"ok": False, "type": "error", "error": "Empty message"}), 400
 
-    # Save the user's message immediately (so next turn can see it)
-    if SAVE_REPLIES and user_email and msg:
-        save_memory(user_email, msg, role="user")
+        # save the user's message first (optional)
+        if SAVE_REPLIES and user_email and msg:
+            save_memory(user_email, msg, role="user")
 
-    # Build preamble (identity + latest context)
-    memory_preamble = load_preamble(user_email)
+        # memory preamble
+        memory_preamble = load_preamble(user_email)
+        lower = msg.lower()
 
-    lower = msg.lower()
-
-    # --- image intent ---
-    if lower.startswith(("generate an image", "create an image", "draw", "make an image", "show me an image")):
-        try:
+        # --- image intent ---
+        if lower.startswith(("generate an image", "create an image", "draw", "make an image", "show me an image")):
             img = do_image(msg)
-            # Optional: save that the user asked for an image
-            if SAVE_REPLIES and user_email:
-                save_memory(user_email, f"Assistant generated an image for: {msg}", role="assistant")
-            return jsonify({
-                "ok": True,
-                "type": "assistant_message",
-                "content": f"Here’s your image for: '{msg}'",
-                "images": [img],  # base64 artifact(s)
-            }), 200
-        except Exception as e:
-            return jsonify({"ok": False, "type": "error", "error": f"Image generation failed: {e}"}), 500
+            return jsonify({"ok": True, "type": "assistant_message",
+                            "content": f"Here’s your image for: '{msg}'",
+                            "images": [img]}), 200
+
+        # --- web search intent ---
+        if lower.startswith(("search:", "web:", "google:", "lookup:", "find:")):
+            query = msg.split(":", 1)[-1].strip() or msg
+            result = do_web_search(query)
+            if "error" in result:
+                return jsonify({"ok": False, "type": "error", "error": result["error"]}), 502
+            return jsonify({"ok": True, "type": "assistant_message",
+                            "content": result["summary"],
+                            "search": {"query": query, "links": result["links"]}}), 200
+
+        # --- document (PDF) intent ---
+        if lower.startswith(("make pdf:", "make document:", "generate document:", "create pdf:")):
+            payload = msg.split(":", 1)[-1].strip()
+            if "|" in payload:
+                title, body = [p.strip() for p in payload.split("|", 1)]
+            else:
+                parts = payload.split("\n", 1)
+                title = parts[0].strip() or "Document"
+                body = (parts[1] if len(parts) > 1 else "").strip() or "(empty)"
+            pdf = do_pdf(title, body)
+            return jsonify({"ok": True, "type": "assistant_message",
+                            "content": f"Generated PDF: {pdf['filename']}",
+                            "files": [pdf]}), 200
+
+        # --- default: text completion (with memory preamble) ---
+        reply = do_text_completion(msg, memory_preamble=memory_preamble)
+        if SAVE_REPLIES and reply and user_email:
+            save_memory(user_email, reply, role="assistant")
+        return jsonify({"ok": True, "type": "assistant_message", "content": reply}), 200
+
+    except Exception as e:
+        return jsonify({"ok": False, "type": "error", "error": f"Server exception: {e}"}), 500
 
     # --- web search intent ---
     if lower.startswith(("search:", "web:", "google:", "lookup:", "find:")):
