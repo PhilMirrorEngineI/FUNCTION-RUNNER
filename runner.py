@@ -190,7 +190,11 @@ def chat():
     if not msg:
         return jsonify({"ok": False, "type": "error", "error": "Empty message"}), 400
 
-    # 1) memory preamble (no-op if envs missing)
+    # 🧠 Save the user's message immediately (so it's in memory for next turn)
+    if SAVE_REPLIES and user_email and msg:
+        save_memory(user_email, msg, role="user")
+
+    # 1️⃣ memory preamble (no-op if envs missing)
     preamble = load_preamble(user_email)
 
     lower = msg.lower()
@@ -213,7 +217,7 @@ def chat():
     except Exception as e:
         reply = f"Error during completion: {e}"
 
-    # 2) optionally save the assistant reply back to Dave memory
+    # 2️⃣ optionally save the assistant reply back to Dave memory
     if SAVE_REPLIES and reply and user_email:
         save_memory(user_email, reply, role="assistant")
 
