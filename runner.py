@@ -1,4 +1,4 @@
-# runner.py — Function Runner (chat + base64 images + web search + PDF)
+# runner.py — Function Runner (chat + base64 images + web search + PDF + memory recall)
 
 import os, io, base64, requests
 from flask import Flask, request, jsonify
@@ -6,15 +6,87 @@ from openai import OpenAI
 
 # ---------- setup ----------
 app = Flask(__name__)
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-TAVILY_KEY = os.getenv("TAVILY_API_KEY")  # optional (for web search)
 
-# ---------- helpers ----------
-def do_text_completion(prompt: str) -> str:
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# Optional: web search
+TAVILY_KEY = os.getenv("TAVILY_API_KEY")
+
+# Optional: Dave memory service
+MEMORY_BASE_URL = os.getenv("MEMORY_BASE_URL", "https://davepmei-ai.onrender.com")
+MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY",    os.getenv("DAVE_API_KEY"))  # allow either name
+MEMORY_LIMIT    = int(os.getenv("MEMORY_LIMIT", "5"))  # how many shards to recall
+SAVE_REPLIES    = os.getenv("SAVE_REPLIES", "false").lower() == "true"  # optionally save assistant replies here too
+
+# ---------- memory helpers ----------
+def _extract_user_id(payload: dict) -> str | None:
+    """
+    Try common fields that your frontend might send.
+    """
+    for k in ("user_id", "userEmail", "email", "user", "uid"):
+        v = payload.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def load_memories(user_id: str, limit: int = MEMORY_LIMIT) -> list[dict]:
+    if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_id):
+        return []
     try:
+        resp = requests.get(
+            f"{MEMORY_BASE_URL}/get_memory",
+            params={"user_id": user_id, "limit": limit},
+            headers={"API_KEY": MEMORY_API_KEY},
+            timeout=10,
+        )
+        j = resp.json() if resp.ok else {}
+        return j.get("items", []) or []
+    except Exception:
+        return []
+
+def save_memory(user_id: str, content: str) -> None:
+    if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_id and content):
+        return
+    try:
+        requests.post(
+            f"{MEMORY_BASE_URL}/save_memory",
+            headers={"API_KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
+            json={"user_id": user_id, "content": content},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+def build_memory_preamble(items: list[dict]) -> str:
+    """
+    Turn retrieved shards into a compact preamble.
+    Keep it short so it doesn’t crowd the model context.
+    """
+    if not items:
+        return ""
+    lines = []
+    for m in items:
+        txt = (m.get("content") or "").strip()
+        if not txt:
+            continue
+        # single-line trim
+        txt = " ".join(txt.split())
+        lines.append(f"- {txt}")
+    if not lines:
+        return ""
+    return "Known context (from prior interactions):\n" + "\n".join(lines)
+
+# ---------- core helpers ----------
+def do_text_completion(prompt: str, memory_preamble: str = "") -> str:
+    try:
+        messages = []
+        if memory_preamble:
+            messages.append({"role": "system", "content": memory_preamble})
+        messages.append({"role": "user", "content": prompt})
+
         r = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=0.7,
         )
         return (r.choices[0].message.content or "").strip()
@@ -102,9 +174,14 @@ def do_pdf(title: str, body: str) -> dict:
 def chat():
     data = request.get_json(force=True) or {}
     msg = (data.get("message") or "").strip()
+    user_id = _extract_user_id(data)
 
     if not msg:
         return jsonify({"ok": False, "type": "error", "error": "Empty message"}), 400
+
+    # Load memories (if configured) and build preamble
+    memories = load_memories(user_id, MEMORY_LIMIT) if user_id else []
+    memory_preamble = build_memory_preamble(memories)
 
     lower = msg.lower()
 
@@ -112,6 +189,14 @@ def chat():
     if lower.startswith(("generate an image", "create an image", "draw", "make an image", "show me an image")):
         try:
             img = do_image(msg)
+            # Optionally save the user prompt and assistant response
+            if user_id:
+                try:
+                    save_memory(user_id, f"User asked for image: {msg}")
+                    if SAVE_REPLIES:
+                        save_memory(user_id, f"Assistant: Image generated for: {msg}")
+                except Exception:
+                    pass
             return jsonify({
                 "ok": True,
                 "type": "assistant_message",
@@ -127,7 +212,14 @@ def chat():
         result = do_web_search(query)
         if "error" in result:
             return jsonify({"ok": False, "type": "error", "error": result["error"]}), 502
-        # Let the UI render a summary + list of links
+        # Optionally save query and summary
+        if user_id:
+            try:
+                save_memory(user_id, f"Search query: {query}")
+                if SAVE_REPLIES:
+                    save_memory(user_id, f"Assistant search summary: {result['summary']}")
+            except Exception:
+                pass
         return jsonify({
             "ok": True,
             "type": "assistant_message",
@@ -147,6 +239,14 @@ def chat():
             body = (parts[1] if len(parts) > 1 else "").strip() or "(empty)"
         try:
             pdf = do_pdf(title, body)
+            # Optionally save
+            if user_id:
+                try:
+                    save_memory(user_id, f"User generated PDF '{title}'")
+                    if SAVE_REPLIES:
+                        save_memory(user_id, f"Assistant: PDF generated '{title}'")
+                except Exception:
+                    pass
             return jsonify({
                 "ok": True,
                 "type": "assistant_message",
@@ -156,8 +256,18 @@ def chat():
         except Exception as e:
             return jsonify({"ok": False, "type": "error", "error": f"PDF generation failed: {e}"}), 500
 
-    # --- default: plain text chat ---
-    reply = do_text_completion(msg)
+    # --- default: plain text chat with memory injection ---
+    reply = do_text_completion(msg, memory_preamble=memory_preamble)
+
+    # Optionally save user message and the assistant’s reply
+    if user_id:
+        try:
+            save_memory(user_id, msg)
+            if SAVE_REPLIES:
+                save_memory(user_id, f"Assistant: {reply}")
+        except Exception:
+            pass
+
     return jsonify({"ok": True, "type": "assistant_message", "content": reply}), 200
 
 @app.get("/health")
