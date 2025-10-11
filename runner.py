@@ -10,16 +10,16 @@ from flask import Flask, request, jsonify
 from openai import OpenAI
 
 # ── Env ──────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY     = os.environ["OPENAI_API_KEY"]                      # sk-...
-ASSISTANT_ID       = os.environ["ASSISTANT_ID"]                        # asst_...
-MEMORY_BASE_URL    = os.environ.get("MEMORY_BASE_URL", "https://davepmei-ai.onrender.com").rstrip("/")
-MEMORY_API_KEY     = os.environ["MEMORY_API_KEY"]
-RUNNER_ACTION_KEY  = os.environ["RUNNER_ACTION_KEY"]                   # Bearer gate for /chat
+OPENAI_API_KEY    = os.environ["OPENAI_API_KEY"]                  # sk-...
+ASSISTANT_ID      = os.environ["ASSISTANT_ID"]                    # asst_...
+MEMORY_BASE_URL   = os.environ.get("MEMORY_BASE_URL", "https://davepmei-ai.onrender.com").rstrip("/")
+MEMORY_API_KEY    = os.environ["MEMORY_API_KEY"]
+RUNNER_ACTION_KEY = os.environ["RUNNER_ACTION_KEY"]               # Bearer gate for /chat
+RUN_MAX_SECS      = float(os.environ.get("RUN_MAX_SECS", "25"))   # keep under gunicorn timeout
 
 # ── Clients / App ────────────────────────────────────────────────────────────
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ── Global JSON error and JSON-only responses ────────────────────────────────
@@ -39,7 +39,7 @@ def force_json_headers(resp):
 def require_runner_key(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        if request.method == "OPTIONS" or request.path in ("/", "/health"):
+        if request.method == "OPTIONS" or request.path in ("/", "/health", "/openai"):
             return fn(*args, **kwargs)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
@@ -52,7 +52,7 @@ def require_runner_key(fn):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def mem_call(path: str, method: str = "GET", params=None, body=None):
-    """Call the Memory API with auth; always return JSON or raise for caller to catch."""
+    """Call the Memory API with auth; always return JSON or raise."""
     url = f"{MEMORY_BASE_URL}{path}"
     headers = {"X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"}
     try:
@@ -63,17 +63,14 @@ def mem_call(path: str, method: str = "GET", params=None, body=None):
     except requests.RequestException as rexc:
         raise RuntimeError(f"memory_api network error: {rexc}") from rexc
 
-    # Attempt JSON; on non-200 Render may still send HTML
-    ct = r.headers.get("content-type", "")
+    ct = (r.headers.get("content-type") or "").lower()
     if "application/json" in ct:
         data = r.json()
     else:
         raise RuntimeError(f"memory_api non-JSON response (status {r.status_code})")
 
-    # Bubble up HTTP failures with JSON payload
     if not r.ok:
         raise RuntimeError(f"memory_api error {r.status_code}: {data}")
-
     return data
 
 def parse_message_kv(message: str) -> dict:
@@ -88,7 +85,7 @@ def parse_message_kv(message: str) -> dict:
 def handle_tool_call(tc):
     """
     Handle a tool call from the Assistant.
-    Supports either unified bridge (function_runner(message="...")) or legacy tools.
+    Supports unified bridge (function_runner(message="...")) or legacy tool names.
     """
     name = getattr(tc.function, "name", "") or ""
     raw_args = json.loads(getattr(tc.function, "arguments", "") or "{}")
@@ -103,7 +100,7 @@ def handle_tool_call(tc):
     defaults = {
         "slide_id": "t-001",
         "glyph_echo": "🪞",
-        "drift_score": 0.00,     # clamp to lawful default
+        "drift_score": 0.00,     # lawful default
         "seal": "LAWFUL",
         "limit": 5,
         "content": "(no content provided)",
@@ -142,7 +139,7 @@ def handle_tool_call(tc):
 def run_once(user_msg: str) -> dict:
     """
     Create a thread, run once with tool loop, and return a dict response.
-    We return a structured dict so /chat can always jsonify cleanly.
+    Always returns JSON-friendly dict.
     """
     try:
         th = client.beta.threads.create()
@@ -155,7 +152,6 @@ def run_once(user_msg: str) -> dict:
         )
 
         started = time.time()
-        MAX_SECS = 45
         SLEEP_SECS = 0.6
 
         while True:
@@ -173,7 +169,7 @@ def run_once(user_msg: str) -> dict:
                         output = json.dumps({"ok": False, "error": f"runner exception: {e}"})
                     outs.append({"tool_call_id": tid, "output": output})
 
-                run = client.beta.threads.runs.submit_tool_outputs(
+                client.beta.threads.runs.submit_tool_outputs(
                     thread_id=th.id,
                     run_id=run.id,
                     tool_outputs=outs
@@ -182,8 +178,8 @@ def run_once(user_msg: str) -> dict:
             elif status in ("completed", "failed", "cancelled", "expired"):
                 break
 
-            if time.time() - started > MAX_SECS:
-                return {"ok": False, "error": "timeout waiting for assistant run"}
+            if time.time() - started > RUN_MAX_SECS:
+                return {"ok": False, "error": f"timeout waiting for assistant run (> {RUN_MAX_SECS}s)"}
 
             time.sleep(SLEEP_SECS)
 
@@ -200,7 +196,6 @@ def run_once(user_msg: str) -> dict:
         return {"ok": True, "assistant": ""}
 
     except Exception as e:
-        # Catch OpenAI/network/config errors and return JSON
         logging.exception("OpenAI run_once error: %s", e)
         return {"ok": False, "source": "openai", "error": str(e)}
 
@@ -214,8 +209,18 @@ def root():
     return jsonify({
         "ok": True,
         "service": "FUNCTION-RUNNER",
-        "endpoints": ["/health", "/chat"]
+        "endpoints": ["/health", "/openai", "/chat"]
     })
+
+# Cheap OpenAI reachability check (no secrets leaked)
+@app.route("/openai", methods=["GET"])
+def openai_diag():
+    try:
+        models = client.models.list()
+        first = models.data[0].id if getattr(models, "data", []) else None
+        return jsonify({"ok": True, "can_reach_openai": True, "first_model": first}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "can_reach_openai": False, "error": str(e)}), 200
 
 @app.route("/chat", methods=["POST"])
 @require_runner_key
@@ -243,7 +248,7 @@ def chat():
     out = run_once(msg)
     app.logger.info("<< Reply: %s", out)
 
-    # Always JSON. If OpenAI/Memory failed, out will contain ok:false + error.
+    # Always JSON. If OpenAI/Memory failed, out contains ok:false + error.
     return jsonify(out), 200
 
 # ── Local dev ─────────────────────────────────────────────────────────────────
