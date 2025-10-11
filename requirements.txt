@@ -1,4 +1,6 @@
-Flask==3.0.3
-gunicorn==21.2
-openai==1.59.6
-httpx
+flask>=3.0,<4
+gunicorn>=21.2,<22
+openai>=1.40,<2
+requests>=2.31,<3
+pillow>=10.3,<11        # only if you’re manipulating images
+python-dotenv>=1.0,<2   # if you use .env locally
