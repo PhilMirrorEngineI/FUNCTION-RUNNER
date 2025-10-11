@@ -29,6 +29,14 @@ def handle_any_error(e):
     logging.exception("Unhandled error: %s", e)
     return jsonify({"ok": False, "error": str(e), "code": code}), 200
 
+@app.errorhandler(404)
+def _json_404(e):
+    return jsonify({"ok": False, "error": "Not found", "code": 404, "path": request.path}), 200
+
+@app.errorhandler(405)
+def _json_405(e):
+    return jsonify({"ok": False, "error": "Method not allowed", "code": 405, "method": request.method, "path": request.path}), 200
+
 @app.after_request
 def force_json_headers(resp):
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
@@ -197,9 +205,13 @@ def openai_diag():
     except Exception as e:
         return jsonify({"ok": False, "can_reach_openai": False, "error": str(e)}), 200
 
-@app.route("/chat", methods=["POST"])
+@app.route("/chat", methods=["POST", "OPTIONS"])
 @require_runner_key
 def chat():
+    app.logger.info("HIT /chat %s %s", request.method, request.headers.get("Content-Type", ""))
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True, "allow": ["POST"]}), 200
+
     data = request.get_json(silent=True) or {}
     if "message" in data and isinstance(data["message"], str):
         msg = data["message"]
