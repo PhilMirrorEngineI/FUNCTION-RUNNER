@@ -226,15 +226,17 @@ def openai_diag():
 @require_runner_key
 def chat():
     """
-    Accepts either:
+    Accepts:
       { "message": "free text" }
-    or a structured JSON which is converted to key=value tokens for tools.
+    or structured JSON which becomes key=value string for tools.
+    Always returns JSON: {ok:bool, assistant?:str, error?:str}
     """
     data = request.get_json(silent=True) or {}
+
+    # Build message string
     if "message" in data and isinstance(data["message"], str):
         msg = data["message"]
     else:
-        # build message if user posts JSON like {"operation":"get_memory","user_id":"phil",...}
         kv_parts = []
         for k, v in data.items():
             if isinstance(v, str):
@@ -245,11 +247,21 @@ def chat():
         msg = " ".join(kv_parts) if kv_parts else "operation=get_memory user_id=phil thread_id=smoke limit=3"
 
     app.logger.info(">> Received: %s", msg)
-    out = run_once(msg)
-    app.logger.info("<< Reply: %s", out)
 
-    # Always JSON. If OpenAI/Memory failed, out contains ok:false + error.
-    return jsonify(out), 200
+    try:
+        out = run_once(msg)
+        # run_once already returns a dict {ok,assistant|error}
+        app.logger.info("<< Reply: %s", out)
+        return jsonify(out), 200
+
+    except Exception as e:
+        app.logger.exception("Chat route error")
+        # Always return valid JSON, even on failure
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "source": "function-runner"
+        }), 200
 
 # ── Local dev ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
