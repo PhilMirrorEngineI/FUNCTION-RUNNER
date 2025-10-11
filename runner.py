@@ -13,36 +13,47 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 
 # Optional: Dave memory service
-MEMORY_BASE_URL = os.getenv("MEMORY_BASE_URL", "https://davepmei-ai.onrender.com")
-MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY",    os.getenv("DAVE_API_KEY"))  # allow either name
-MEMORY_LIMIT    = int(os.getenv("MEMORY_LIMIT", "5"))  # how many shards to recall
-SAVE_REPLIES    = os.getenv("SAVE_REPLIES", "false").lower() == "true"  # optionally save assistant replies here too
+# near the top:
+MEMORY_BASE = os.getenv("MEMORY_BASE_URL")      # e.g. https://davepmei-ai.onrender.com
+MEMORY_KEY  = os.getenv("MEMORY_API_KEY")       # same key as frontend uses
+SAVE_REPLIES = os.getenv("SAVE_REPLIES", "true").lower() == "true"
 
-# ---------- memory helpers ----------
-def _extract_user_id(payload: dict) -> str | None:
-    """
-    Try common fields that your frontend might send.
-    """
-    for k in ("user_id", "userEmail", "email", "user", "uid"):
-        v = payload.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-def load_memories(user_id: str, limit: int = MEMORY_LIMIT) -> list[dict]:
-    if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_id):
-        return []
+def load_preamble(user_email: str, limit: int = 8) -> str:
+    if not (MEMORY_BASE and MEMORY_KEY and user_email):
+        return ""
     try:
-        resp = requests.get(
-            f"{MEMORY_BASE_URL}/get_memory",
-            params={"user_id": user_id, "limit": limit},
-            headers={"API_KEY": MEMORY_API_KEY},
-            timeout=10,
+        r = requests.get(
+            f"{MEMORY_BASE}/get_memory",
+            params={"user_id": user_email, "limit": limit},
+            headers={"Authorization": f"Bearer {MEMORY_KEY}"},
+            timeout=8,
         )
-        j = resp.json() if resp.ok else {}
-        return j.get("items", []) or []
+        data = r.json() if r.ok else {}
+        items = data.get("items", [])
+        if not items:
+            return ""
+        # collapse to a short preamble
+        lines = []
+        for it in items:
+            content = (it.get("content") or "").strip()
+            if content:
+                lines.append(f"- {content}")
+        return "Known context from prior interactions:\n" + "\n".join(lines[:limit])
     except Exception:
-        return []
+        return ""
+
+def save_memory(user_email: str, content: str, role: str = "assistant"):
+    if not (MEMORY_BASE and MEMORY_KEY and user_email and content):
+        return
+    try:
+        requests.post(
+            f"{MEMORY_BASE}/save_memory",
+            json={"user_id": user_email, "content": content, "role": role},
+            headers={"Authorization": f"Bearer {MEMORY_KEY}"},
+            timeout=8,
+        )
+    except Exception:
+        pass
 
 def save_memory(user_id: str, content: str) -> None:
     if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_id and content):
