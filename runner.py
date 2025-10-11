@@ -185,37 +185,39 @@ def do_pdf(title: str, body: str) -> dict:
 def chat():
     data = request.get_json(force=True) or {}
     msg = (data.get("message") or "").strip()
-    user_id = _extract_user_id(data)
+    user_email = (data.get("userEmail") or data.get("email") or "").strip()
 
     if not msg:
         return jsonify({"ok": False, "type": "error", "error": "Empty message"}), 400
 
-    # Load memories (if configured) and build preamble
-    memories = load_memories(user_id, MEMORY_LIMIT) if user_id else []
-    memory_preamble = build_memory_preamble(memories)
+    # 1) memory preamble (no-op if envs missing)
+    preamble = load_preamble(user_email)
 
     lower = msg.lower()
 
-    # --- image intent ---
-    if lower.startswith(("generate an image", "create an image", "draw", "make an image", "show me an image")):
-        try:
-            img = do_image(msg)
-            # Optionally save the user prompt and assistant response
-            if user_id:
-                try:
-                    save_memory(user_id, f"User asked for image: {msg}")
-                    if SAVE_REPLIES:
-                        save_memory(user_id, f"Assistant: Image generated for: {msg}")
-                except Exception:
-                    pass
-            return jsonify({
-                "ok": True,
-                "type": "assistant_message",
-                "content": f"Here’s your image for: '{msg}'",
-                "images": [img],
-            }), 200
-        except Exception as e:
-            return jsonify({"ok": False, "type": "error", "error": f"Image generation failed: {e}"}), 500
+    # ... (image / search / pdf handlers unchanged) ...
+
+    # default text chat now injects the preamble
+    try:
+        messages = []
+        if preamble:
+            messages.append({"role": "system", "content": preamble})
+        messages.append({"role": "user", "content": msg})
+
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+        )
+        reply = (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        reply = f"Error during completion: {e}"
+
+    # 2) optionally save the assistant reply back to Dave memory
+    if SAVE_REPLIES and reply and user_email:
+        save_memory(user_email, reply, role="assistant")
+
+    return jsonify({"ok": True, "type": "assistant_message", "content": reply}), 200
 
     # --- web search intent ---
     if lower.startswith(("search:", "web:", "google:", "lookup:", "find:")):
