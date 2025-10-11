@@ -1,6 +1,8 @@
+openai>=1.40,<2
 flask>=3.0,<4
 gunicorn>=21.2,<22
-openai>=1.40,<2
 requests>=2.31,<3
-pillow>=10.3,<11        # only if you’re manipulating images
-python-dotenv>=1.0,<2   # if you use .env locally
+reportlab>=4.2,<5
+# (pillow only if you manipulate images after generation)
+# pillow>=10.3,<11
+# python-dotenv>=1.0,<2 (only for local .env)
