@@ -10,24 +10,23 @@ from flask import Flask, request, jsonify
 from openai import OpenAI
 
 # ── Env ──────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY    = os.environ["OPENAI_API_KEY"]                  # sk-...
-ASSISTANT_ID      = os.environ["ASSISTANT_ID"]                    # asst_...
+OPENAI_API_KEY    = os.environ["OPENAI_API_KEY"]
+ASSISTANT_ID      = os.environ["ASSISTANT_ID"]
 MEMORY_BASE_URL   = os.environ.get("MEMORY_BASE_URL", "https://davepmei-ai.onrender.com").rstrip("/")
 MEMORY_API_KEY    = os.environ["MEMORY_API_KEY"]
-RUNNER_ACTION_KEY = os.environ["RUNNER_ACTION_KEY"]               # Bearer gate for /chat
-RUN_MAX_SECS      = float(os.environ.get("RUN_MAX_SECS", "25"))   # keep under gunicorn timeout
+RUNNER_ACTION_KEY = os.environ["RUNNER_ACTION_KEY"]
+RUN_MAX_SECS      = float(os.environ.get("RUN_MAX_SECS", "25"))
 
 # ── Clients / App ────────────────────────────────────────────────────────────
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ── Global JSON error and JSON-only responses ────────────────────────────────
+# ── Always return JSON (no HTML leaks) ───────────────────────────────────────
 @app.errorhandler(Exception)
 def handle_any_error(e):
     code = getattr(e, "code", 500)
     logging.exception("Unhandled error: %s", e)
-    # 200 so frontends show the message, not a hard 500 page
     return jsonify({"ok": False, "error": str(e), "code": code}), 200
 
 @app.after_request
@@ -35,7 +34,7 @@ def force_json_headers(resp):
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
     return resp
 
-# ── Auth helper (protect /chat) ──────────────────────────────────────────────
+# ── Auth guard for /chat ─────────────────────────────────────────────────────
 def require_runner_key(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
@@ -50,9 +49,8 @@ def require_runner_key(fn):
         return fn(*args, **kwargs)
     return wrapped
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Memory API helper ────────────────────────────────────────────────────────
 def mem_call(path: str, method: str = "GET", params=None, body=None):
-    """Call the Memory API with auth; always return JSON or raise."""
     url = f"{MEMORY_BASE_URL}{path}"
     headers = {"X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"}
     try:
@@ -73,8 +71,8 @@ def mem_call(path: str, method: str = "GET", params=None, body=None):
         raise RuntimeError(f"memory_api error {r.status_code}: {data}")
     return data
 
+# ── Tools bridge ─────────────────────────────────────────────────────────────
 def parse_message_kv(message: str) -> dict:
-    """Parse free-form 'key=value' pairs (quotes supported)."""
     args = {}
     for tok in shlex.split(message or ""):
         if "=" in tok:
@@ -83,10 +81,6 @@ def parse_message_kv(message: str) -> dict:
     return args
 
 def handle_tool_call(tc):
-    """
-    Handle a tool call from the Assistant.
-    Supports unified bridge (function_runner(message="...")) or legacy tool names.
-    """
     name = getattr(tc.function, "name", "") or ""
     raw_args = json.loads(getattr(tc.function, "arguments", "") or "{}")
 
@@ -96,11 +90,10 @@ def handle_tool_call(tc):
     else:
         args = dict(raw_args)
 
-    # Defaults (do not override provided)
     defaults = {
         "slide_id": "t-001",
         "glyph_echo": "🪞",
-        "drift_score": 0.00,     # lawful default
+        "drift_score": 0.00,
         "seal": "LAWFUL",
         "limit": 5,
         "content": "(no content provided)",
@@ -110,13 +103,11 @@ def handle_tool_call(tc):
 
     operation = (args.get("operation") or name or "").strip().lower()
 
-    # Reads
     if operation in ("memory_bridge", "get_memory", "recall_memory_window"):
         params = {k: args.get(k) for k in ("user_id", "thread_id", "limit") if args.get(k) is not None}
         out = mem_call("/get_memory", "GET", params=params)
         return tc.id, json.dumps(out)
 
-    # Writes
     if operation in ("save_memory", "reflect_and_store_memory"):
         out = mem_call("/save_memory", "POST", body={
             "user_id":     args.get("user_id", ""),
@@ -129,18 +120,14 @@ def handle_tool_call(tc):
         })
         return tc.id, json.dumps(out)
 
-    # Unknown op
     return tc.id, json.dumps({
         "ok": False,
         "error": f"unknown operation '{operation}'",
         "received": {"name": name, "args": args}
     })
 
+# ── Run once with OpenAI ─────────────────────────────────────────────────────
 def run_once(user_msg: str) -> dict:
-    """
-    Create a thread, run once with tool loop, and return a dict response.
-    Always returns JSON-friendly dict.
-    """
     try:
         th = client.beta.threads.create()
         client.beta.threads.messages.create(th.id, role="user", content=user_msg)
@@ -152,8 +139,6 @@ def run_once(user_msg: str) -> dict:
         )
 
         started = time.time()
-        SLEEP_SECS = 0.6
-
         while True:
             run = client.beta.threads.runs.retrieve(thread_id=th.id, run_id=run.id)
             status = run.status
@@ -168,11 +153,8 @@ def run_once(user_msg: str) -> dict:
                         tid = tc.id
                         output = json.dumps({"ok": False, "error": f"runner exception: {e}"})
                     outs.append({"tool_call_id": tid, "output": output})
-
                 client.beta.threads.runs.submit_tool_outputs(
-                    thread_id=th.id,
-                    run_id=run.id,
-                    tool_outputs=outs
+                    thread_id=th.id, run_id=run.id, tool_outputs=outs
                 )
 
             elif status in ("completed", "failed", "cancelled", "expired"):
@@ -181,20 +163,14 @@ def run_once(user_msg: str) -> dict:
             if time.time() - started > RUN_MAX_SECS:
                 return {"ok": False, "error": f"timeout waiting for assistant run (> {RUN_MAX_SECS}s)"}
 
-            time.sleep(SLEEP_SECS)
+            time.sleep(0.6)
 
-        # Collect most recent assistant text
         msgs = client.beta.threads.messages.list(thread_id=th.id, order="desc").data
         for m in msgs:
             if m.role == "assistant":
-                parts = []
-                for part in m.content:
-                    if getattr(part, "type", "") == "text":
-                        parts.append(part.text.value)
+                parts = [part.text.value for part in m.content if getattr(part, "type", "") == "text"]
                 return {"ok": True, "assistant": "\n".join(parts) if parts else ""}
-
         return {"ok": True, "assistant": ""}
-
     except Exception as e:
         logging.exception("OpenAI run_once error: %s", e)
         return {"ok": False, "source": "openai", "error": str(e)}
@@ -212,7 +188,6 @@ def root():
         "endpoints": ["/health", "/openai", "/chat"]
     })
 
-# Cheap OpenAI reachability check (no secrets leaked)
 @app.route("/openai", methods=["GET"])
 def openai_diag():
     try:
@@ -225,43 +200,20 @@ def openai_diag():
 @app.route("/chat", methods=["POST"])
 @require_runner_key
 def chat():
-    """
-    Accepts:
-      { "message": "free text" }
-    or structured JSON which becomes key=value string for tools.
-    Always returns JSON: {ok:bool, assistant?:str, error?:str}
-    """
     data = request.get_json(silent=True) or {}
-
-    # Build message string
     if "message" in data and isinstance(data["message"], str):
         msg = data["message"]
     else:
         kv_parts = []
         for k, v in data.items():
-            if isinstance(v, str):
-                v_out = v if " " not in v else json.dumps(v)
-            else:
-                v_out = json.dumps(v)
+            v_out = v if isinstance(v, str) and " " not in v else json.dumps(v)
             kv_parts.append(f"{k}={v_out}")
         msg = " ".join(kv_parts) if kv_parts else "operation=get_memory user_id=phil thread_id=smoke limit=3"
 
     app.logger.info(">> Received: %s", msg)
-
-    try:
-        out = run_once(msg)
-        # run_once already returns a dict {ok,assistant|error}
-        app.logger.info("<< Reply: %s", out)
-        return jsonify(out), 200
-
-    except Exception as e:
-        app.logger.exception("Chat route error")
-        # Always return valid JSON, even on failure
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-            "source": "function-runner"
-        }), 200
+    out = run_once(msg)
+    app.logger.info("<< Reply: %s", out)
+    return jsonify(out), 200
 
 # ── Local dev ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
