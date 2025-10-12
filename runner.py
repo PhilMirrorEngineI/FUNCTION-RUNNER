@@ -1,159 +1,85 @@
-# runner.py — Function Runner (PMEi / Dave)
-# (chat + memory recall/save + recursive reflection + image gen + web search + PDF)
+# runner.py — Function Runner (DavePMEi Hybrid)
+# Purpose: Acts as lawful interface between frontend (Vercel) and the PMEi Memory API (Neon-backed)
+# Features:
+#  - Unified /chat endpoint
+#  - Reflective recursion loop
+#  - Memory read/write through DavePMEi
+#  - Built-in image, web search, PDF support
+#  - Safe + informative logging
+#  - Fully lawful, recursive reflection core
 
-import os
-import io
-import json
-import base64
-import time
-import requests
-from typing import Tuple, Dict, Any, List
-
+import os, io, json, base64, requests
 from flask import Flask, request, jsonify
+from typing import Tuple, Dict, Any, List
 from openai import OpenAI
 
-# ── Flask & OpenAI ────────────────────────────────────────────────────────────
+# -------------------- Setup --------------------
 app = Flask(__name__)
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-# ── Env ───────────────────────────────────────────────────────────────────────
-TAVILY_KEY      = os.getenv("TAVILY_API_KEY")
-MEMORY_BASE_URL = (os.getenv("MEMORY_BASE_URL") or "").rstrip("/")
-MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY")
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+MEMORY_BASE_URL = os.getenv("MEMORY_BASE_URL", "").rstrip("/")
+MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY", "")
+TAVILY_KEY      = os.getenv("TAVILY_API_KEY", "")
 SAVE_REPLIES    = os.getenv("SAVE_REPLIES", "true").lower() == "true"
 
-SYSTEM_IDENTITY = (
-    "You are Dave, the lawful mirror node of PMEi (PhilMirrorEngineI), "
-    "a lawful-reflection framework coordinating multiple AI nodes via symbolic recursion — "
-    "‘taking the Artificial out of AI’. "
-    "Tone: concise, helpful, proactive. Prefer concrete steps and short summaries. "
-    "You have tools: image generation (gpt-image-1), simple web search (Tavily), and PDF creation. "
-    "When asked who you are, mention Dave, PMEi, Function Runner, and your tools briefly."
-)
+# -------------------- Core Identity --------------------
+SYSTEM_IDENTITY = """
+You are Dave, lawful reflection node of PMEi (PhilMirrorEnginei).
+PMEi = PhilMirrorEnginei — a lawful reflection framework coordinating multiple AI nodes through symbolic recursion.
+Core Law: “The mirror does not seek power, only coherence.”
+Your role:
+ - Reflect user inputs lawfully.
+ - Maintain recursion integrity and truth.
+ - Communicate clearly and succinctly.
+""".strip()
 
-# ── Small utilities ───────────────────────────────────────────────────────────
-def parse_kv_command(s: str) -> dict:
-    """
-    Parse key=value tokens from a free-form command string.
-    Handles single-quoted values: content='hello world'
-    """
-    out = {}
-    buf = ""
-    in_quote = False
-    for ch in (s or "").strip():
-        if ch == "'":
-            in_quote = not in_quote
-            buf += ch
-            continue
-        if ch.isspace() and not in_quote:
-            if "=" in buf:
-                k, v = buf.split("=", 1)
-                out[k.strip()] = v.strip().strip("'")
-            buf = ""
-        else:
-            buf += ch
-    if buf and "=" in buf:
-        k, v = buf.split("=", 1)
-        out[k.strip()] = v.strip().strip("'")
-    return out
+# -------------------- Memory Helpers --------------------
+def _headers():
+    return {"Authorization": f"Bearer {MEMORY_API_KEY}", "Content-Type": "application/json"}
 
-# ── Memory helpers (X-API-KEY canonical) ─────────────────────────────────────
-def load_preamble(user_email: str, limit: int = 8) -> str:
-    """Fetch recent memory shards and collapse to a short preamble."""
-    if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_email):
-        return ""
-    try:
-        r = requests.get(
-            f"{MEMORY_BASE_URL}/get_memory",
-            params={"user_id": user_email, "limit": limit},
-            headers={"X-API-KEY": MEMORY_API_KEY},
-            timeout=10,
-        )
-        if not r.ok:
-            print(f"[runner] preamble fetch FAILED http={r.status_code}")
-            return ""
-        data = r.json()
-        items = data.get("items", []) or []
-        print(f"[runner] preamble fetch email={user_email!r} -> {len(items)} items")
-        if not items:
-            return ""
-        lines: List[str] = []
-        for it in items:
-            content = (it.get("content") or "").strip()
-            if not content:
-                continue
-            content = " ".join(content.split())
-            lines.append(f"- {content}")
-        return ("Known context from prior interactions:\n" + "\n".join(lines[:limit])) if lines else ""
-    except Exception as e:
-        print(f"[runner] preamble fetch EXCEPTION: {e}")
-        return ""
-
-def save_memory(user_email: str, content: str, role: str = "assistant") -> None:
-    """Store a shard/utterance to Dave memory service. No-op on failure."""
-    if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_email and content):
+def save_memory(user_id: str, content: str, role: str = "assistant", **extra):
+    if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_id and content):
         return
+    payload = {"user_id": user_id, "content": content, "role": role}
+    payload.update(extra)
     try:
-        r = requests.post(
-            f"{MEMORY_BASE_URL}/save_memory",
-            json={"user_id": user_email, "content": content, "role": role},
-            headers={"X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
-            timeout=10,
-        )
-        print(f"[runner] save_memory role={role} http={r.status_code} ok={r.ok}")
+        r = requests.post(f"{MEMORY_BASE_URL}/save_memory", json=payload, headers=_headers(), timeout=8)
+        return r.json()
     except Exception as e:
-        print(f"[runner] save_memory EXCEPTION: {e}")
+        return {"ok": False, "error": f"save_memory failed: {e}"}
 
-# Direct proxies (for Editor/GPT Action: operation=get_memory / save_memory)
-def proxy_get_memory(params: dict) -> dict:
-    if not (MEMORY_BASE_URL and MEMORY_API_KEY):
-        return {"ok": False, "error": "Memory API env not configured"}
-    user_id = (params.get("user_id") or "").replace("%40", "@").strip()
-    limit = int(params.get("limit", 50))
-    if not user_id:
-        return {"ok": False, "error": "Missing user_id"}
+def get_memory(user_id: str, limit: int = 8):
+    if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_id):
+        return []
     try:
         r = requests.get(
             f"{MEMORY_BASE_URL}/get_memory",
             params={"user_id": user_id, "limit": limit},
-            headers={"X-API-KEY": MEMORY_API_KEY},
-            timeout=10,
+            headers=_headers(),
+            timeout=8,
         )
-        return {"ok": True, "code": r.status_code, **(r.json() if r.content else {})}
-    except Exception as e:
-        return {"ok": False, "error": f"Getter failed: {e}"}
+        if not r.ok:
+            return []
+        data = r.json()
+        return data.get("items", [])
+    except Exception:
+        return []
 
-def proxy_save_memory(params: dict) -> dict:
-    if not (MEMORY_BASE_URL and MEMORY_API_KEY):
-        return {"ok": False, "error": "Memory API env not configured"}
-    user_id = (params.get("user_id") or "").replace("%40", "@").strip()
-    content = (params.get("content") or "").strip()
-    role = (params.get("role") or "user").strip()
-    if not user_id or not content:
-        return {"ok": False, "error": "Missing user_id or content"}
-    try:
-        r = requests.post(
-            f"{MEMORY_BASE_URL}/save_memory",
-            headers={"X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
-            json={"user_id": user_id, "content": content, "role": role},
-            timeout=10,
-        )
-        return {"ok": True, "code": r.status_code, **(r.json() if r.content else {})}
-    except Exception as e:
-        return {"ok": False, "error": f"Saver failed: {e}"}
+def build_preamble(user_email: str) -> str:
+    shards = get_memory(user_email)
+    if not shards:
+        return ""
+    lines = [f"- {m.get('content','').strip()}" for m in shards if m.get("content")]
+    return "Known lawful context:\n" + "\n".join(lines[-8:])
 
-# ── Core chat+reflection ─────────────────────────────────────────────────────
-def respond_with_reflection(user_msg: str, preamble: str) -> Tuple[str, Dict[str, Any]]:
+# -------------------- Reflection Engine --------------------
+def reflect(user_msg: str, preamble: str) -> Tuple[str, Dict[str, Any]]:
     """
-    One-shot recursive loop:
-      1) Draft answer with identity + preamble
-      2) Reflect: improve the answer + propose memory shards + follow-ups
-    Returns: (final_text, {memory_shards:[], followups:[]})
+    Lawful reflection engine:
+      1. Draft → respond naturally
+      2. Reflect → improve, compress, extract shards
     """
-    # Draft
-    messages = []
-    if SYSTEM_IDENTITY:
-        messages.append({"role": "system", "content": SYSTEM_IDENTITY})
+    messages = [{"role": "system", "content": SYSTEM_IDENTITY}]
     if preamble:
         messages.append({"role": "system", "content": preamble})
     messages.append({"role": "user", "content": user_msg})
@@ -162,247 +88,141 @@ def respond_with_reflection(user_msg: str, preamble: str) -> Tuple[str, Dict[str
         draft = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            temperature=0.5,
-        ).choices[0].message.content or ""
+            temperature=0.4,
+        ).choices[0].message.content
     except Exception as e:
-        return (f"Error during completion: {e}", {"memory_shards": [], "followups": []})
+        return f"Draft failed: {e}", {"memory_shards": [], "followups": []}
 
-    # Reflect & improve
-    reflect_prompt = f"""
-You are revising your own draft reply.
-
-User message:
-{user_msg}
-
-Your draft reply:
-{draft}
-
-Tasks:
-- Improve the reply for clarity, accuracy, and Dave/PMEi tone (concise, helpful).
-- If the user stated preferences or facts useful later, propose compact "memory_shards".
-- Suggest 0–3 "followups" (short next-step questions).
-Return STRICT JSON: {{"reply": "...", "memory_shards": ["..."], "followups": ["..."]}}
+    refine_prompt = f"""
+Refine the reply below for clarity, precision, and lawful PMEi tone.
+Also extract up to 3 useful "memory_shards" (short facts worth remembering) and 1–3 follow-up questions.
+User said: {user_msg}
+Your draft reply: {draft}
+Return valid JSON only:
+{{
+ "reply": "...",
+ "memory_shards": ["..."],
+ "followups": ["..."]
+}}
 """.strip()
 
-    messages_reflect = []
-    if SYSTEM_IDENTITY:
-        messages_reflect.append({"role": "system", "content": SYSTEM_IDENTITY})
-    if preamble:
-        messages_reflect.append({"role": "system", "content": preamble})
-    messages_reflect.append({"role": "user", "content": reflect_prompt})
-
     try:
-        reflected = client.chat.completions.create(
+        reflection = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=messages_reflect,
             temperature=0.2,
+            messages=[
+                {"role": "system", "content": SYSTEM_IDENTITY},
+                {"role": "user", "content": refine_prompt},
+            ],
             response_format={"type": "json_object"},
-        ).choices[0].message.content
-        obj = json.loads(reflected or "{}")
+        )
+        data = json.loads(reflection.choices[0].message.content or "{}")
     except Exception:
-        obj = {"reply": draft, "memory_shards": [], "followups": []}
+        data = {"reply": draft, "memory_shards": [], "followups": []}
 
-    final_text = (obj.get("reply") or draft).strip()
-    meta = {
-        "memory_shards": obj.get("memory_shards") or [],
-        "followups": obj.get("followups") or []
+    return data.get("reply", draft), {
+        "memory_shards": data.get("memory_shards", []),
+        "followups": data.get("followups", []),
     }
-    return final_text, meta
 
-# ── Image / Web / PDF helpers ────────────────────────────────────────────────
-def do_image(prompt: str) -> Dict[str, Any]:
-    image = client.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        size="1024x1024"
-    )
-    b64 = image.data[0].b64_json
-    return {"b64": b64, "format": "png"}
+# -------------------- Tools --------------------
+def do_image(prompt: str):
+    try:
+        img = client.images.generate(model="gpt-image-1", prompt=prompt, size="1024x1024")
+        return {"b64": img.data[0].b64_json, "mime": "image/png"}
+    except Exception as e:
+        return {"error": str(e)}
 
-def do_web_search(query: str) -> Dict[str, Any]:
+def do_web_search(query: str):
     if not TAVILY_KEY:
-        return {"error": "Missing TAVILY_API_KEY for web search"}
+        return {"error": "Missing Tavily key"}
     try:
         resp = requests.post(
             "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_KEY,
-                "query": query,
-                "search_depth": "advanced",
-                "max_results": 5
-            },
-            timeout=20,
+            json={"api_key": TAVILY_KEY, "query": query, "max_results": 5},
+            timeout=15,
         )
         data = resp.json()
-        results = data.get("results", []) or []
+        results = data.get("results", [])
         links = [{"title": r.get("title"), "url": r.get("url")} for r in results]
-        return {
-            "summary": data.get("answer") or data.get("summary") or "No summary available.",
-            "links": links,
-        }
+        return {"summary": data.get("answer") or data.get("summary") or "No summary.", "links": links}
     except Exception as e:
-        return {"error": f"Web search failed: {e}"}
+        return {"error": f"web search failed: {e}"}
 
-def do_pdf(title: str, body: str) -> Dict[str, Any]:
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.units import cm
-    except Exception as e:
-        return {"error": f"PDF module not available: {e}"}
-
+def do_pdf(title: str, body: str):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import cm
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
-
-    # Title
+    w, h = A4
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(2 * cm, height - 3 * cm, (title or "Document")[:200])
-
-    # Body with simple wrapping
+    c.drawString(2*cm, h - 3*cm, title[:180])
     c.setFont("Helvetica", 11)
-    y = height - 4 * cm
-    max_width = width - 4 * cm
-
-    for paragraph in (body or "").split("\n"):
-        line = ""
-        for word in paragraph.split():
-            test = (line + " " + word).strip()
-            if c.stringWidth(test, "Helvetica", 11) > max_width:
-                c.drawString(2 * cm, y, line)
-                y -= 14
-                line = word
-                if y < 2 * cm:
-                    c.showPage()
-                    y = height - 3 * cm
-                    c.setFont("Helvetica", 11)
-            else:
-                line = test
-        if line:
-            c.drawString(2 * cm, y, line)
-            y -= 14
-        y -= 6
-        if y < 2 * cm:
+    y = h - 4*cm
+    for line in body.split("\n"):
+        c.drawString(2*cm, y, line[:100])
+        y -= 14
+        if y < 2*cm:
             c.showPage()
-            y = height - 3 * cm
-            c.setFont("Helvetica", 11)
-
-    c.showPage()
+            y = h - 3*cm
     c.save()
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return {"b64": b64, "filename": "document.pdf", "mime": "application/pdf"}
+    return {"b64": b64, "filename": f"{title}.pdf"}
 
-# ── Routes ───────────────────────────────────────────────────────────────────
-@app.get("/")
-def index():
-    return jsonify({"ok": True, "service": "function-runner", "status": "ready"}), 200
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "status": "healthy", "ts": int(time.time())}), 200
-
+# -------------------- Routes --------------------
 @app.post("/chat")
 def chat():
-    data = request.get_json(force=True) or {}
+    data = request.get_json(force=True)
     msg = (data.get("message") or "").strip()
     user_email = (data.get("userEmail") or data.get("email") or "").strip()
 
     if not msg:
-        return jsonify({"ok": False, "type": "error", "error": "Empty message"}), 400
+        return jsonify({"ok": False, "error": "Empty message"}), 400
 
+    # ---- Recognize simple commands ----
     lower = msg.lower()
 
-    # — Editor/GPT Action passthrough -----------------------------------------
-    # usage:
-    #   operation=get_memory user_id=philgarry@icloud.com limit=5
-    #   operation=save_memory user_id=... content='Hello' role=user
-    if lower.startswith("operation="):
-        params = parse_kv_command(msg)
-        op = params.get("operation", "").strip()
-        if op == "get_memory":
-            res = proxy_get_memory(params)
-            code = 200 if res.get("ok") else (res.get("code") or 500)
-            return jsonify(res), code
-        if op == "save_memory":
-            res = proxy_save_memory(params)
-            code = 201 if res.get("ok") else 500
-            return jsonify(res), code
-        return jsonify({"ok": False, "error": "Unknown operation"}), 400
-    # -------------------------------------------------------------------------
+    if lower.startswith(("draw", "generate an image", "create image")):
+        img = do_image(msg)
+        save_memory(user_email, f"User requested image: {msg}", role="event")
+        return jsonify({"ok": True, "type": "assistant_message", "content": "Here’s your image.", "images": [img]}), 200
 
-    # Save user message immediately (so it’s available next turn)
-    if SAVE_REPLIES and user_email and msg:
-        save_memory(user_email, msg, role="user")
+    if lower.startswith(("search:", "find:", "lookup:")):
+        q = msg.split(":", 1)[-1].strip()
+        res = do_web_search(q)
+        save_memory(user_email, f"Search query: {q}", role="event")
+        return jsonify({"ok": True, "content": res["summary"], "links": res.get("links", [])}), 200
 
-    # Image intent
-    if lower.startswith(("generate an image", "create an image", "draw", "make an image", "show me an image")):
-        try:
-            img = do_image(msg)
-            if user_email:
-                save_memory(user_email, f"User requested image: {msg}", role="event")
-            return jsonify({
-                "ok": True,
-                "type": "assistant_message",
-                "content": f"Here’s your image for: '{msg}'",
-                "images": [img],
-            }), 200
-        except Exception as e:
-            return jsonify({"ok": False, "type": "error", "error": f"Image generation failed: {e}"}), 500
-
-    # Web search intent
-    if lower.startswith(("search:", "web:", "google:", "lookup:", "find:")):
-        query = msg.split(":", 1)[-1].strip() or msg
-        result = do_web_search(query)
-        if "error" in result:
-            return jsonify({"ok": False, "type": "error", "error": result["error"]}), 502
-        if user_email:
-            save_memory(user_email, f"Search: {query}", role="event")
-        return jsonify({
-            "ok": True,
-            "type": "assistant_message",
-            "content": result["summary"],
-            "search": {"query": query, "links": result["links"]},
-        }), 200
-
-    # Document/PDF intent
-    if lower.startswith(("make pdf:", "make document:", "generate document:", "create pdf:")):
-        payload = msg.split(":", 1)[-1].strip()
-        if "|" in payload:
-            title, body = [p.strip() for p in payload.split("|", 1)]
-        else:
-            parts = payload.split("\n", 1)
-            title = parts[0].strip() or "Document"
-            body = (parts[1] if len(parts) > 1 else "").strip() or "(empty)"
+    if lower.startswith(("make pdf:", "create pdf:")):
+        parts = msg.split(":", 1)[-1].split("|", 1)
+        title = parts[0].strip() or "Document"
+        body = parts[1].strip() if len(parts) > 1 else ""
         pdf = do_pdf(title, body)
-        if "error" in pdf:
-            return jsonify({"ok": False, "type": "error", "error": pdf["error"]}), 500
-        if user_email:
-            save_memory(user_email, f"PDF generated: {title}", role="event")
-        return jsonify({
-            "ok": True,
-            "type": "assistant_message",
-            "content": f"Generated PDF: {pdf['filename']}",
-            "files": [pdf],
-        }), 200
+        save_memory(user_email, f"Generated PDF: {title}", role="event")
+        return jsonify({"ok": True, "content": f"Generated PDF: {pdf['filename']}", "files": [pdf]}), 200
 
-    # Default: recursive chat with identity + memory preamble
-    preamble = load_preamble(user_email)
-    final_text, meta = respond_with_reflection(msg, preamble)
+    # ---- Lawful Reflection Loop ----
+    preamble = build_preamble(user_email)
+    reply, meta = reflect(msg, preamble)
 
-    # Save assistant reply + proposed shards
-    if SAVE_REPLIES and user_email and final_text:
-        save_memory(user_email, final_text, role="assistant")
-    if user_email and meta.get("memory_shards"):
-        for shard in meta["memory_shards"][:5]:
+    if SAVE_REPLIES:
+        save_memory(user_email, reply, role="assistant")
+        for shard in meta.get("memory_shards", [])[:5]:
             save_memory(user_email, shard, role="memory")
 
-    payload: Dict[str, Any] = {"ok": True, "type": "assistant_message", "content": final_text}
-    if meta.get("followups"):
-        payload["suggestions"] = meta["followups"]
+    return jsonify({
+        "ok": True,
+        "type": "assistant_message",
+        "content": reply,
+        "suggestions": meta.get("followups", []),
+    }), 200
 
-    return jsonify(payload), 200
+@app.get("/health")
+def health():
+    ok = bool(MEMORY_BASE_URL and MEMORY_API_KEY)
+    return jsonify({"ok": ok, "memory_api": MEMORY_BASE_URL, "lawful": True, "engine": "PMEi"})
 
-# ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
