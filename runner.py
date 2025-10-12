@@ -1,145 +1,195 @@
-# runner.py — Function Runner (PMEi safe minimal)
-# Flask app with health, echo chat, and optional Memory API passthrough.
-# Works with: gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:$PORT runner:app
+# function_run.py — PMEi Function Runner (companion to server.py)
+# Start with:
+#   gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:$PORT function_run:app
 
 import os
 import json
 import time
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 from flask import Flask, request, jsonify
 
 # -----------------------------
-# Config (env-driven, all optional)
+# Config (env-driven)
 # -----------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-TAVILY_KEY = os.getenv("TAVILY_API_KEY", "")
-# Strip trailing "/" so we can safely add paths
-MEMORY_BASE_URL = (os.getenv("MEMORY_BASE_URL") or "").rstrip("/")
-MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
+OPENAI_API_KEY   = (os.getenv("OPENAI_API_KEY") or "").strip()
+OPENAI_MODEL     = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+MEMORY_BASE_URL  = (os.getenv("MEMORY_BASE_URL") or "").rstrip("/")   # IMPORTANT: no trailing slash
+MEMORY_API_KEY   = (os.getenv("MEMORY_API_KEY") or "").strip()
+TAVILY_API_KEY   = (os.getenv("TAVILY_API_KEY") or "").strip()        # reserved (unused here)
 
-# If you use PostgreSQL/Neon later, add its URL here (not required to boot)
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# Optional OpenAI initialization (safe if key missing)
+try:
+    from openai import OpenAI  # openai >= 1.x
+    _openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except Exception:
+    _openai_client = None
 
 # -----------------------------
 # App
 # -----------------------------
 app = Flask(__name__)
-
 BOOT_TS = int(time.time())
 
-def ok() -> Dict[str, Any]:
-    return {"ok": True}
+# -----------------------------
+# Helpers
+# -----------------------------
+def jok(data: Any = None, **extra):
+    payload = {"ok": True}
+    if data is not None:
+        payload["data"] = data
+    if extra:
+        payload.update(extra)
+    return jsonify(payload)
 
-def _mem_enabled() -> bool:
+def jfail(msg: str, code: int = 400, **extra):
+    payload = {"ok": False, "error": msg}
+    if extra:
+        payload.update(extra)
+    return jsonify(payload), code
+
+def get_json() -> Tuple[Optional[dict], Optional[Tuple[Any, int]]]:
+    try:
+        data = request.get_json(force=True) or {}
+        if not isinstance(data, dict):
+            return None, jfail("JSON body must be an object", 400)
+        return data, None
+    except Exception:
+        return None, jfail("Invalid or missing JSON body", 400)
+
+def mem_enabled() -> bool:
     return bool(MEMORY_BASE_URL and MEMORY_API_KEY)
 
+def mem_headers() -> Dict[str, str]:
+    # Header name aligned with your Memory API
+    return {"Content-Type": "application/json", "X-API-KEY": MEMORY_API_KEY}
+
+def safe_upstream_json(resp: requests.Response) -> Any:
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": resp.text[:2000], "status": resp.status_code}
+
 # -----------------------------
-# Health & root
+# Root & Health
 # -----------------------------
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({
+    return jok({
         "service": "PMEi Function Runner",
         "status": "alive",
         "since_epoch": BOOT_TS,
-        "memory_api_enabled": _mem_enabled(),
+        "openai_enabled": bool(_openai_client),
+        "memory_api_enabled": mem_enabled(),
     })
 
 @app.route("/health", methods=["GET"])
 @app.route("/healthz", methods=["GET"])
 def health():
-    return jsonify({
-        "ok": True,
+    return jok({
         "uptime_seconds": int(time.time()) - BOOT_TS,
-        "memory_api_enabled": _mem_enabled(),
+        "openai_enabled": bool(_openai_client),
+        "memory_api_enabled": mem_enabled(),
     })
 
 # -----------------------------
-# Simple chat echo (text in -> text out)
+# Simple chat echo (cheap, predictable)
 # -----------------------------
 @app.route("/chat", methods=["POST"])
 def chat():
-    """
-    Minimal, predictable echo endpoint.
-    Body: {"message": "...", "userEmail": "...", "meta": {...}}
-    """
-    try:
-        data = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({"ok": False, "error": "Invalid JSON"}), 400
-
-    message = (data.get("message") or "").strip()
+    data, err = get_json()
+    if err:
+        return err
+    msg = (data.get("message") or "").strip()
     user_email = (data.get("userEmail") or "").strip()
     meta = data.get("meta") or {}
-
-    if not message:
-        return jsonify({"ok": False, "error": "message is required"}), 400
-
-    # Echo response (no OpenAI call by default — predictable + cheap)
-    reply = {
-        "reply": f"🪞 Echo: {message}",
+    if not msg:
+        return jfail("message is required", 400)
+    return jok({
+        "reply": f"🪞 Echo: {msg[:2000]}",
         "userEmail": user_email,
         "meta": meta,
         "ts": int(time.time()),
-    }
-    return jsonify({"ok": True, "data": reply})
+    })
 
 # -----------------------------
-# Optional Memory API passthroughs
-# Only used if MEMORY_BASE_URL + MEMORY_API_KEY are set.
+# OpenAI passthrough (optional)
 # -----------------------------
-def _mem_headers() -> Dict[str, str]:
-    return {
-        "Content-Type": "application/json",
-        # Use the exact header your API expects:
-        "X-API-KEY": MEMORY_API_KEY,
-    }
+@app.route("/openai/chat", methods=["POST"])
+def openai_chat():
+    if not _openai_client:
+        return jfail("OpenAI not configured", 503)
+    data, err = get_json()
+    if err:
+        return err
+    message = (data.get("message") or "").strip()
+    system = (data.get("system") or "You are a concise, helpful assistant.").strip()
+    model = (data.get("model") or OPENAI_MODEL).strip() or OPENAI_MODEL
+    temperature = float(data.get("temperature") or 0.2)
+    max_tokens = int(data.get("max_tokens") or 512)
+    if not message:
+        return jfail("message is required", 400)
+    if max_tokens > 4096:
+        max_tokens = 4096
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": message}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        text = resp.choices[0].message.content if resp and resp.choices else ""
+        return jok({"model": model, "reply": text})
+    except Exception as e:
+        return jfail(f"OpenAI error: {e}", 502)
 
+# -----------------------------
+# Memory API passthroughs
+# -----------------------------
 @app.route("/memory/save", methods=["POST"])
 def memory_save():
-    if not _mem_enabled():
-        return jsonify({"ok": False, "error": "Memory API not configured"}), 503
+    if not mem_enabled():
+        return jfail("Memory API not configured", 503)
+    data, err = get_json()
+    if err:
+        return err
     try:
-        payload = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({"ok": False, "error": "Invalid JSON"}), 400
-
-    url = f"{MEMORY_BASE_URL}/save_memory"
-    try:
-        r = requests.post(url, headers=_mem_headers(), data=json.dumps(payload), timeout=10)
-        return jsonify({"upstream_status": r.status_code, "ok": r.ok, "data": safe_json(r)})
+        r = requests.post(f"{MEMORY_BASE_URL}/save_memory",
+                          headers=mem_headers(),
+                          data=json.dumps(data),
+                          timeout=12)
+        return jsonify({
+            "ok": r.ok,
+            "upstream_status": r.status_code,
+            "data": safe_upstream_json(r),
+        }), (200 if r.ok else 502)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Upstream error: {e}"}), 502
+        return jfail(f"Upstream error: {e}", 502)
 
 @app.route("/memory/get", methods=["POST"])
 def memory_get():
-    if not _mem_enabled():
-        return jsonify({"ok": False, "error": "Memory API not configured"}), 503
+    if not mem_enabled():
+        return jfail("Memory API not configured", 503)
+    data, err = get_json()
+    if err:
+        return err
     try:
-        payload = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({"ok": False, "error": "Invalid JSON"}), 400
-
-    # Support both POST body and query args in your upstream.
-    url = f"{MEMORY_BASE_URL}/get_memory"
-    try:
-        r = requests.post(url, headers=_mem_headers(), data=json.dumps(payload), timeout=10)
-        return jsonify({"upstream_status": r.status_code, "ok": r.ok, "data": safe_json(r)})
+        r = requests.post(f"{MEMORY_BASE_URL}/get_memory",
+                          headers=mem_headers(),
+                          data=json.dumps(data),
+                          timeout=12)
+        return jsonify({
+            "ok": r.ok,
+            "upstream_status": r.status_code,
+            "data": safe_upstream_json(r),
+        }), (200 if r.ok else 502)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Upstream error: {e}"}), 502
-
-def safe_json(resp: requests.Response) -> Any:
-    try:
-        return resp.json()
-    except Exception:
-        return {"raw": resp.text[:2000]}  # avoid huge payloads
+        return jfail(f"Upstream error: {e}", 502)
 
 # -----------------------------
-# Local run
+# Local dev
 # -----------------------------
 if __name__ == "__main__":
-    # Local dev: python runner.py
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
