@@ -1,4 +1,4 @@
-# function_run.py — PMEi Function Runner (companion to server.py)
+# runner.py — PMEi Function Runner (companion to server.py)
 # Start with:
 #   gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:$PORT function_run:app
 
