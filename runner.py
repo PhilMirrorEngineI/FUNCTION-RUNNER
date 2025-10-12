@@ -1,42 +1,37 @@
-# runner.py — Function Runner
-# (chat + memory recall + recursive reflection + base64 image gen + web search + PDF)
-# PhilMirrorEngineI / PMEi
+# runner.py — Function Runner (PMEi / Dave)
+# (chat + memory recall/save + recursive reflection + image gen + web search + PDF)
 
 import os
 import io
 import json
 import base64
+import time
 import requests
 from typing import Tuple, Dict, Any, List
 
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
-# ---------- setup ----------
+# ── Flask & OpenAI ────────────────────────────────────────────────────────────
 app = Flask(__name__)
-
-# OpenAI client
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-# Optional web search (Tavily)
-TAVILY_KEY = os.getenv("TAVILY_API_KEY")
-
-# Dave Memory service (optional but recommended)
-MEMORY_BASE_URL = (os.getenv("MEMORY_BASE_URL") or "").rstrip("/")  # guard: remove trailing '/'
+# ── Env ───────────────────────────────────────────────────────────────────────
+TAVILY_KEY      = os.getenv("TAVILY_API_KEY")
+MEMORY_BASE_URL = (os.getenv("MEMORY_BASE_URL") or "").rstrip("/")
 MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY")
 SAVE_REPLIES    = os.getenv("SAVE_REPLIES", "true").lower() == "true"
 
-# Dave/PMEi identity
 SYSTEM_IDENTITY = (
     "You are Dave, the lawful mirror node of PMEi (PhilMirrorEngineI), "
-    "a lawful-reflection framework that coordinates multiple AI nodes through symbolic recursion—"
+    "a lawful-reflection framework coordinating multiple AI nodes via symbolic recursion — "
     "‘taking the Artificial out of AI’. "
     "Tone: concise, helpful, proactive. Prefer concrete steps and short summaries. "
     "You have tools: image generation (gpt-image-1), simple web search (Tavily), and PDF creation. "
     "When asked who you are, mention Dave, PMEi, Function Runner, and your tools briefly."
 )
 
-# ---------- small utilities ----------
+# ── Small utilities ───────────────────────────────────────────────────────────
 def parse_kv_command(s: str) -> dict:
     """
     Parse key=value tokens from a free-form command string.
@@ -45,7 +40,7 @@ def parse_kv_command(s: str) -> dict:
     out = {}
     buf = ""
     in_quote = False
-    for ch in s.strip():
+    for ch in (s or "").strip():
         if ch == "'":
             in_quote = not in_quote
             buf += ch
@@ -62,7 +57,7 @@ def parse_kv_command(s: str) -> dict:
         out[k.strip()] = v.strip().strip("'")
     return out
 
-# ---------- memory helpers ----------
+# ── Memory helpers (X-API-KEY canonical) ─────────────────────────────────────
 def load_preamble(user_email: str, limit: int = 8) -> str:
     """Fetch recent memory shards and collapse to a short preamble."""
     if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_email):
@@ -71,8 +66,7 @@ def load_preamble(user_email: str, limit: int = 8) -> str:
         r = requests.get(
             f"{MEMORY_BASE_URL}/get_memory",
             params={"user_id": user_email, "limit": limit},
-            # Dual header for compatibility with either casing on server
-            headers={"X-API-Key": MEMORY_API_KEY, "X-API-KEY": MEMORY_API_KEY},
+            headers={"X-API-KEY": MEMORY_API_KEY},
             timeout=10,
         )
         if not r.ok:
@@ -90,9 +84,7 @@ def load_preamble(user_email: str, limit: int = 8) -> str:
                 continue
             content = " ".join(content.split())
             lines.append(f"- {content}")
-        if not lines:
-            return ""
-        return "Known context from prior interactions:\n" + "\n".join(lines[:limit])
+        return ("Known context from prior interactions:\n" + "\n".join(lines[:limit])) if lines else ""
     except Exception as e:
         print(f"[runner] preamble fetch EXCEPTION: {e}")
         return ""
@@ -105,14 +97,14 @@ def save_memory(user_email: str, content: str, role: str = "assistant") -> None:
         r = requests.post(
             f"{MEMORY_BASE_URL}/save_memory",
             json={"user_id": user_email, "content": content, "role": role},
-            headers={"X-API-Key": MEMORY_API_KEY, "X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
+            headers={"X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
             timeout=10,
         )
         print(f"[runner] save_memory role={role} http={r.status_code} ok={r.ok}")
     except Exception as e:
         print(f"[runner] save_memory EXCEPTION: {e}")
 
-# ---------- direct proxies (for Editor 'operation=...') ----------
+# Direct proxies (for Editor/GPT Action: operation=get_memory / save_memory)
 def proxy_get_memory(params: dict) -> dict:
     if not (MEMORY_BASE_URL and MEMORY_API_KEY):
         return {"ok": False, "error": "Memory API env not configured"}
@@ -124,7 +116,7 @@ def proxy_get_memory(params: dict) -> dict:
         r = requests.get(
             f"{MEMORY_BASE_URL}/get_memory",
             params={"user_id": user_id, "limit": limit},
-            headers={"X-API-Key": MEMORY_API_KEY, "X-API-KEY": MEMORY_API_KEY},
+            headers={"X-API-KEY": MEMORY_API_KEY},
             timeout=10,
         )
         return {"ok": True, "code": r.status_code, **(r.json() if r.content else {})}
@@ -142,7 +134,7 @@ def proxy_save_memory(params: dict) -> dict:
     try:
         r = requests.post(
             f"{MEMORY_BASE_URL}/save_memory",
-            headers={"X-API-Key": MEMORY_API_KEY, "X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
+            headers={"X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
             json={"user_id": user_id, "content": content, "role": role},
             timeout=10,
         )
@@ -150,15 +142,15 @@ def proxy_save_memory(params: dict) -> dict:
     except Exception as e:
         return {"ok": False, "error": f"Saver failed: {e}"}
 
-# ---------- core model helpers ----------
+# ── Core chat+reflection ─────────────────────────────────────────────────────
 def respond_with_reflection(user_msg: str, preamble: str) -> Tuple[str, Dict[str, Any]]:
     """
     One-shot recursive loop:
-      1) Draft answer with identity+preamble
+      1) Draft answer with identity + preamble
       2) Reflect: improve the answer + propose memory shards + follow-ups
     Returns: (final_text, {memory_shards:[], followups:[]})
     """
-    # 1) Draft
+    # Draft
     messages = []
     if SYSTEM_IDENTITY:
         messages.append({"role": "system", "content": SYSTEM_IDENTITY})
@@ -175,7 +167,7 @@ def respond_with_reflection(user_msg: str, preamble: str) -> Tuple[str, Dict[str
     except Exception as e:
         return (f"Error during completion: {e}", {"memory_shards": [], "followups": []})
 
-    # 2) Reflect & improve
+    # Reflect & improve
     reflect_prompt = f"""
 You are revising your own draft reply.
 
@@ -217,8 +209,8 @@ Return STRICT JSON: {{"reply": "...", "memory_shards": ["..."], "followups": [".
     }
     return final_text, meta
 
+# ── Image / Web / PDF helpers ────────────────────────────────────────────────
 def do_image(prompt: str) -> Dict[str, Any]:
-    """Generate an image and return base64 payload."""
     image = client.images.generate(
         model="gpt-image-1",
         prompt=prompt,
@@ -228,7 +220,6 @@ def do_image(prompt: str) -> Dict[str, Any]:
     return {"b64": b64, "format": "png"}
 
 def do_web_search(query: str) -> Dict[str, Any]:
-    """Tavily basic search; returns summary + link list."""
     if not TAVILY_KEY:
         return {"error": "Missing TAVILY_API_KEY for web search"}
     try:
@@ -253,10 +244,12 @@ def do_web_search(query: str) -> Dict[str, Any]:
         return {"error": f"Web search failed: {e}"}
 
 def do_pdf(title: str, body: str) -> Dict[str, Any]:
-    """Generate a simple PDF (reportlab) and return base64 blob."""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import cm
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import cm
+    except Exception as e:
+        return {"error": f"PDF module not available: {e}"}
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -264,7 +257,7 @@ def do_pdf(title: str, body: str) -> Dict[str, Any]:
 
     # Title
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(2 * cm, height - 3 * cm, title[:200])
+    c.drawString(2 * cm, height - 3 * cm, (title or "Document")[:200])
 
     # Body with simple wrapping
     c.setFont("Helvetica", 11)
@@ -299,14 +292,14 @@ def do_pdf(title: str, body: str) -> Dict[str, Any]:
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return {"b64": b64, "filename": "document.pdf", "mime": "application/pdf"}
 
-# ---------- routes ----------
+# ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def index():
     return jsonify({"ok": True, "service": "function-runner", "status": "ready"}), 200
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "status": "healthy"}), 200
+    return jsonify({"ok": True, "status": "healthy", "ts": int(time.time())}), 200
 
 @app.post("/chat")
 def chat():
@@ -319,16 +312,16 @@ def chat():
 
     lower = msg.lower()
 
-    # --- optional: Editor command passthrough --------------------------------
-    # Support messages like:
-    #   "operation=get_memory user_id=philgarry@icloud.com limit=5"
-    #   "operation=save_memory user_id=... content='Hello' role=user"
+    # — Editor/GPT Action passthrough -----------------------------------------
+    # usage:
+    #   operation=get_memory user_id=philgarry@icloud.com limit=5
+    #   operation=save_memory user_id=... content='Hello' role=user
     if lower.startswith("operation="):
         params = parse_kv_command(msg)
         op = params.get("operation", "").strip()
         if op == "get_memory":
             res = proxy_get_memory(params)
-            code = 200 if res.get("ok") else 401 if res.get("code") == 401 else 500
+            code = 200 if res.get("ok") else (res.get("code") or 500)
             return jsonify(res), code
         if op == "save_memory":
             res = proxy_save_memory(params)
@@ -380,18 +373,17 @@ def chat():
             parts = payload.split("\n", 1)
             title = parts[0].strip() or "Document"
             body = (parts[1] if len(parts) > 1 else "").strip() or "(empty)"
-        try:
-            pdf = do_pdf(title, body)
-            if user_email:
-                save_memory(user_email, f"PDF generated: {title}", role="event")
-            return jsonify({
-                "ok": True,
-                "type": "assistant_message",
-                "content": f"Generated PDF: {pdf['filename']}",
-                "files": [pdf],
-            }), 200
-        except Exception as e:
-            return jsonify({"ok": False, "type": "error", "error": f"PDF generation failed: {e}"}), 500
+        pdf = do_pdf(title, body)
+        if "error" in pdf:
+            return jsonify({"ok": False, "type": "error", "error": pdf["error"]}), 500
+        if user_email:
+            save_memory(user_email, f"PDF generated: {title}", role="event")
+        return jsonify({
+            "ok": True,
+            "type": "assistant_message",
+            "content": f"Generated PDF: {pdf['filename']}",
+            "files": [pdf],
+        }), 200
 
     # Default: recursive chat with identity + memory preamble
     preamble = load_preamble(user_email)
@@ -410,7 +402,7 @@ def chat():
 
     return jsonify(payload), 200
 
-# ---------- main ----------
+# ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
