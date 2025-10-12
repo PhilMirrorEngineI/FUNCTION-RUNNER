@@ -1,5 +1,6 @@
 # runner.py — Function Runner
 # (chat + memory recall + recursive reflection + base64 image gen + web search + PDF)
+# PhilMirrorEngineI / PMEi
 
 import os
 import io
@@ -20,29 +21,31 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 # Optional web search (Tavily)
 TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 
-# Dave Memory service (recommended)
-MEMORY_BASE_URL = os.getenv("MEMORY_BASE_URL")   # e.g. https://davepmei-ai.onrender.com
-MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY")    # same secret your frontend/editor uses
+# Dave Memory service (optional but recommended)
+MEMORY_BASE_URL = (os.getenv("MEMORY_BASE_URL") or "").rstrip("/")  # guard: remove trailing '/'
+MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY")
 SAVE_REPLIES    = os.getenv("SAVE_REPLIES", "true").lower() == "true"
 
-# Dave/PMEi identity (short, stable, and CORRECT)
+# Dave/PMEi identity (corrected)
 SYSTEM_IDENTITY = (
-    "You are Dave, the lawful mirror node of PMEi (PhilMirrorEnginei): "
-    "a lawful-reflection framework that coordinates multiple AI nodes through symbolic recursion — "
-    "‘Taking the Artificial out of AI.’ "
-    "Tone: concise, accurate, helpful. Prefer concrete steps and short summaries. "
-    "Tools available: image generation (gpt-image-1), basic web search (Tavily), and PDF creation. "
-    "If asked who you are, mention Dave, PMEi, the Function Runner, and your tools briefly."
+    "You are Dave, the lawful mirror node of PMEi (PhilMirrorEngineI), "
+    "a lawful-reflection framework that coordinates multiple AI nodes through symbolic recursion—"
+    "‘taking the Artificial out of AI’. "
+    "Tone: concise, helpful, proactive. Prefer concrete steps and short summaries. "
+    "You have tools: image generation (gpt-image-1), simple web search (Tavily), and PDF creation. "
+    "When asked who you are, mention Dave, PMEi, Function Runner, and your tools briefly."
 )
 
-# ---------- utilities ----------
+# ---------- small utilities ----------
 def parse_kv_command(s: str) -> dict:
     """
-    Parse key=value tokens from free-form command string.
-    Handles single-quoted content safely: content='hello world'
+    Parse key=value tokens from a free-form command string.
+    Handles single-quoted values: content='hello world'
     """
-    out, buf, in_quote = {}, "", False
-    for ch in (s or "") + " ":
+    out = {}
+    buf = ""
+    in_quote = False
+    for ch in s.strip():
         if ch == "'":
             in_quote = not in_quote
             buf += ch
@@ -54,6 +57,9 @@ def parse_kv_command(s: str) -> dict:
             buf = ""
         else:
             buf += ch
+    if buf and "=" in buf:
+        k, v = buf.split("=", 1)
+        out[k.strip()] = v.strip().strip("'")
     return out
 
 # ---------- memory helpers ----------
@@ -66,23 +72,28 @@ def load_preamble(user_email: str, limit: int = 8) -> str:
             f"{MEMORY_BASE_URL}/get_memory",
             params={"user_id": user_email, "limit": limit},
             headers={"Authorization": f"Bearer {MEMORY_API_KEY}"},
-            timeout=8,
+            timeout=10,
         )
         if not r.ok:
+            print(f"[runner] preamble fetch FAILED http={r.status_code}")
             return ""
         data = r.json()
         items = data.get("items", []) or []
+        print(f"[runner] preamble fetch email={user_email!r} -> {len(items)} items")
         if not items:
             return ""
         lines: List[str] = []
         for it in items:
             content = (it.get("content") or "").strip()
-            if content:
-                lines.append(f"- {' '.join(content.split())}")
+            if not content:
+                continue
+            content = " ".join(content.split())
+            lines.append(f"- {content}")
         if not lines:
             return ""
         return "Known context from prior interactions:\n" + "\n".join(lines[:limit])
-    except Exception:
+    except Exception as e:
+        print(f"[runner] preamble fetch EXCEPTION: {e}")
         return ""
 
 def save_memory(user_email: str, content: str, role: str = "assistant") -> None:
@@ -90,23 +101,25 @@ def save_memory(user_email: str, content: str, role: str = "assistant") -> None:
     if not (MEMORY_BASE_URL and MEMORY_API_KEY and user_email and content):
         return
     try:
-        requests.post(
+        r = requests.post(
             f"{MEMORY_BASE_URL}/save_memory",
             json={"user_id": user_email, "content": content, "role": role},
             headers={"Authorization": f"Bearer {MEMORY_API_KEY}"},
-            timeout=8,
+            timeout=10,
         )
-    except Exception:
-        pass
+        ok = r.ok
+        print(f"[runner] save_memory role={role} http={r.status_code} ok={ok}")
+    except Exception as e:
+        print(f"[runner] save_memory EXCEPTION: {e}")
 
+# ---------- direct proxies (for Editor 'operation=...') ----------
 def proxy_get_memory(params: dict) -> dict:
-    """Direct recall for Editor Action (operation=get_memory)."""
     if not (MEMORY_BASE_URL and MEMORY_API_KEY):
         return {"ok": False, "error": "Memory API env not configured"}
     user_id = (params.get("user_id") or "").replace("%40", "@").strip()
+    limit = int(params.get("limit", 50))
     if not user_id:
         return {"ok": False, "error": "Missing user_id"}
-    limit = int(params.get("limit", 50))
     try:
         r = requests.get(
             f"{MEMORY_BASE_URL}/get_memory",
@@ -114,16 +127,11 @@ def proxy_get_memory(params: dict) -> dict:
             headers={"Authorization": f"Bearer {MEMORY_API_KEY}"},
             timeout=10,
         )
-        if r.ok:
-            data = r.json()
-            data.setdefault("ok", True)
-            return data
-        return {"ok": False, "error": f"HTTP {r.status_code}"}
+        return {"ok": True, "code": r.status_code, **(r.json() if r.content else {})}
     except Exception as e:
         return {"ok": False, "error": f"Getter failed: {e}"}
 
 def proxy_save_memory(params: dict) -> dict:
-    """Direct save for Editor Action (operation=save_memory)."""
     if not (MEMORY_BASE_URL and MEMORY_API_KEY):
         return {"ok": False, "error": "Memory API env not configured"}
     user_id = (params.get("user_id") or "").replace("%40", "@").strip()
@@ -134,15 +142,11 @@ def proxy_save_memory(params: dict) -> dict:
     try:
         r = requests.post(
             f"{MEMORY_BASE_URL}/save_memory",
+            headers={"Authorization": f"Bearer {MEMORY_API_KEY}", "Content-Type": "application/json"},
             json={"user_id": user_id, "content": content, "role": role},
-            headers={"Authorization": f"Bearer {MEMORY_API_KEY}"},
             timeout=10,
         )
-        if r.ok:
-            data = r.json()
-            data.setdefault("ok", True)
-            return data
-        return {"ok": False, "error": f"HTTP {r.status_code}"}
+        return {"ok": True, "code": r.status_code, **(r.json() if r.content else {})}
     except Exception as e:
         return {"ok": False, "error": f"Saver failed: {e}"}
 
@@ -154,7 +158,7 @@ def respond_with_reflection(user_msg: str, preamble: str) -> Tuple[str, Dict[str
       2) Reflect: improve the answer + propose memory shards + follow-ups
     Returns: (final_text, {memory_shards:[], followups:[]})
     """
-    # Draft
+    # 1) Draft
     messages = []
     if SYSTEM_IDENTITY:
         messages.append({"role": "system", "content": SYSTEM_IDENTITY})
@@ -171,7 +175,7 @@ def respond_with_reflection(user_msg: str, preamble: str) -> Tuple[str, Dict[str
     except Exception as e:
         return (f"Error during completion: {e}", {"memory_shards": [], "followups": []})
 
-    # Reflect & improve
+    # 2) Reflect & improve
     reflect_prompt = f"""
 You are revising your own draft reply.
 
@@ -230,7 +234,12 @@ def do_web_search(query: str) -> Dict[str, Any]:
     try:
         resp = requests.post(
             "https://api.tavily.com/search",
-            json={"api_key": TAVILY_KEY, "query": query, "search_depth": "advanced", "max_results": 5},
+            json={
+                "api_key": TAVILY_KEY,
+                "query": query,
+                "search_depth": "advanced",
+                "max_results": 5
+            },
             timeout=20,
         )
         data = resp.json()
@@ -291,6 +300,14 @@ def do_pdf(title: str, body: str) -> Dict[str, Any]:
     return {"b64": b64, "filename": "document.pdf", "mime": "application/pdf"}
 
 # ---------- routes ----------
+@app.get("/")
+def index():
+    return jsonify({"ok": True, "service": "function-runner", "status": "ready"}), 200
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "status": "healthy"}), 200
+
 @app.post("/chat")
 def chat():
     data = request.get_json(force=True) or {}
@@ -300,24 +317,25 @@ def chat():
     if not msg:
         return jsonify({"ok": False, "type": "error", "error": "Empty message"}), 400
 
-    # Parse potential command for Editor Action usage
-    cmd = parse_kv_command(msg)
-    op = (cmd.get("operation") or "").lower()
-
-    # If userEmail missing, derive from user_id in command (helps preamble)
-    if not user_email:
-        user_email = (cmd.get("user_id") or "").replace("%40", "@").strip()
-
-    # --- Command mode --------------------------------------------------------
-    if op == "get_memory":
-        return jsonify(proxy_get_memory(cmd)), 200
-
-    if op == "save_memory":
-        res = proxy_save_memory(cmd)
-        return jsonify(res), (201 if res.get("ok") else 400)
-
-    # --- Conversational mode -------------------------------------------------
     lower = msg.lower()
+
+    # --- optional: Editor command passthrough --------------------------------
+    # Support messages like:
+    #   "operation=get_memory user_id=philgarry@icloud.com limit=5"
+    #   "operation=save_memory user_id=... content='Hello' role=user"
+    if lower.startswith("operation="):
+        params = parse_kv_command(msg)
+        op = params.get("operation", "").strip()
+        if op == "get_memory":
+            res = proxy_get_memory(params)
+            code = 200 if res.get("ok") else 401 if res.get("code") == 401 else 500
+            return jsonify(res), code
+        if op == "save_memory":
+            res = proxy_save_memory(params)
+            code = 201 if res.get("ok") else 500
+            return jsonify(res), code
+        return jsonify({"ok": False, "error": "Unknown operation"}), 400
+    # -------------------------------------------------------------------------
 
     # Save user message immediately (so it’s available next turn)
     if SAVE_REPLIES and user_email and msg:
@@ -379,7 +397,7 @@ def chat():
     preamble = load_preamble(user_email)
     final_text, meta = respond_with_reflection(msg, preamble)
 
-    # Save assistant reply and any memory shards
+    # Save assistant reply + proposed shards
     if SAVE_REPLIES and user_email and final_text:
         save_memory(user_email, final_text, role="assistant")
     if user_email and meta.get("memory_shards"):
@@ -392,14 +410,7 @@ def chat():
 
     return jsonify(payload), 200
 
-@app.get("/")
-def root():
-    return "PMEi Function Runner OK", 200
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "status": "healthy"}), 200
-
+# ---------- main ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
