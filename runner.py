@@ -26,7 +26,7 @@ MEMORY_BASE_URL = (os.getenv("MEMORY_BASE_URL") or "").rstrip("/")  # guard: rem
 MEMORY_API_KEY  = os.getenv("MEMORY_API_KEY")
 SAVE_REPLIES    = os.getenv("SAVE_REPLIES", "true").lower() == "true"
 
-# Dave/PMEi identity (corrected)
+# Dave/PMEi identity
 SYSTEM_IDENTITY = (
     "You are Dave, the lawful mirror node of PMEi (PhilMirrorEngineI), "
     "a lawful-reflection framework that coordinates multiple AI nodes through symbolic recursion—"
@@ -71,7 +71,8 @@ def load_preamble(user_email: str, limit: int = 8) -> str:
         r = requests.get(
             f"{MEMORY_BASE_URL}/get_memory",
             params={"user_id": user_email, "limit": limit},
-            headers={"Authorization": f"Bearer {MEMORY_API_KEY}"},
+            # Dual header for compatibility with either casing on server
+            headers={"X-API-Key": MEMORY_API_KEY, "X-API-KEY": MEMORY_API_KEY},
             timeout=10,
         )
         if not r.ok:
@@ -104,11 +105,10 @@ def save_memory(user_email: str, content: str, role: str = "assistant") -> None:
         r = requests.post(
             f"{MEMORY_BASE_URL}/save_memory",
             json={"user_id": user_email, "content": content, "role": role},
-            headers={"Authorization": f"Bearer {MEMORY_API_KEY}"},
+            headers={"X-API-Key": MEMORY_API_KEY, "X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
             timeout=10,
         )
-        ok = r.ok
-        print(f"[runner] save_memory role={role} http={r.status_code} ok={ok}")
+        print(f"[runner] save_memory role={role} http={r.status_code} ok={r.ok}")
     except Exception as e:
         print(f"[runner] save_memory EXCEPTION: {e}")
 
@@ -124,7 +124,7 @@ def proxy_get_memory(params: dict) -> dict:
         r = requests.get(
             f"{MEMORY_BASE_URL}/get_memory",
             params={"user_id": user_id, "limit": limit},
-            headers={"Authorization": f"Bearer {MEMORY_API_KEY}"},
+            headers={"X-API-Key": MEMORY_API_KEY, "X-API-KEY": MEMORY_API_KEY},
             timeout=10,
         )
         return {"ok": True, "code": r.status_code, **(r.json() if r.content else {})}
@@ -142,7 +142,7 @@ def proxy_save_memory(params: dict) -> dict:
     try:
         r = requests.post(
             f"{MEMORY_BASE_URL}/save_memory",
-            headers={"Authorization": f"Bearer {MEMORY_API_KEY}", "Content-Type": "application/json"},
+            headers={"X-API-Key": MEMORY_API_KEY, "X-API-KEY": MEMORY_API_KEY, "Content-Type": "application/json"},
             json={"user_id": user_id, "content": content, "role": role},
             timeout=10,
         )
