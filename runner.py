@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 from flask import Flask, request, jsonify
+import threading  # added for keepalive thread
 
 # -----------------------------
 # Config (env-driven)
@@ -30,6 +31,33 @@ except Exception:
 # App
 # -----------------------------
 app = Flask(__name__)
+
+# -----------------------------
+# Keepalive Thread (prevents Render idle sleep)
+# -----------------------------
+def _keepalive():
+    """Self-ping loop to keep the Render container awake."""
+    url = os.getenv("SELF_HEALTH_URL", "").strip()
+    interval = int(os.getenv("KEEPALIVE_INTERVAL", "240"))  # default = 4 minutes
+    if not url:
+        print("[KEEPALIVE] SELF_HEALTH_URL not set; skipping loop.")
+        return
+    print(f"[KEEPALIVE] Active; pinging {url} every {interval} seconds")
+    while True:
+        try:
+            r = requests.get(url, timeout=10)
+            print(f"[KEEPALIVE] Ping {url} -> {r.status_code}")
+        except Exception as e:
+            print(f"[KEEPALIVE ERROR] {e}")
+        time.sleep(interval)
+
+_enable = os.getenv("ENABLE_KEEPALIVE", "true").lower()
+if _enable in ("1", "true", "yes", "on"):
+    threading.Thread(target=_keepalive, daemon=True).start()
+    print("[KEEPALIVE] Background thread started")
+else:
+    print("[KEEPALIVE] Disabled by env var")
+
 BOOT_TS = int(time.time())
 
 # -----------------------------
