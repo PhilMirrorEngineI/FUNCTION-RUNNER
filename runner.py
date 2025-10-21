@@ -1,4 +1,4 @@
-# runner.py — PMEi Function Runner (lawful triple-ping warm build)
+# runner.py — PMEi Function Runner (lawful triple-ping warm build + DB wake)
 # Start with:
 #   gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:$PORT function_run:app
 #
@@ -89,6 +89,22 @@ def _triple_warmup():
         time.sleep(3)
     print("[WARMUP] Triple ping complete.")
 
+# ---------- DB Wake Ping ----------
+def _db_wake_ping():
+    """Periodically pings DavePMEi to keep Neon DB warm."""
+    target = f"{MEMORY_BASE_URL}/health" if MEMORY_BASE_URL else None
+    if not target:
+        print("[DBWAKE] Skipped (no MEMORY_BASE_URL)")
+        return
+    print(f"[DBWAKE] Active: pinging {target} every 180s to keep Neon alive")
+    while True:
+        try:
+            r = requests.get(target, timeout=10)
+            print(f"[DBWAKE] Ping -> {r.status_code} @ {int(time.time())}")
+        except Exception as e:
+            print(f"[DBWAKE] Error: {e}")
+        time.sleep(180)
+
 # ---------- Threads ----------
 _enable = os.getenv("ENABLE_KEEPALIVE", "true").lower()
 if _enable in ("1", "true", "yes", "on"):
@@ -98,6 +114,7 @@ else:
     print("[KEEPALIVE] Disabled by env var")
 
 threading.Thread(target=_triple_warmup, daemon=True).start()
+threading.Thread(target=_db_wake_ping, daemon=True).start()
 
 # ---------- Routes ----------
 @app.route("/", methods=["GET"])
