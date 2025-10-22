@@ -1,23 +1,24 @@
-# runner.py — PMEi Function Runner (lawful triple-ping warm build)
-# Start with:
-#   gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:$PORT function_run:app
+# runner.py — PMEi Function Runner (lawful memory core)
+# Run with:
+#   gunicorn -w 1 -k gthread -t 120 -b 0.0.0.0:$PORT runner:app
 #
-# Env:
-#   SELF_HEALTH_URL      = https://function-runner.onrender.com/health
-#   KEEPALIVE_INTERVAL   = 30
-#   ENABLE_KEEPALIVE     = true
-#   MEMORY_BASE_URL      = https://davepmei-ai.onrender.com
-#   MEMORY_API_KEY       = <secret>
-#   OPENAI_API_KEY       = <optional>
-#   OPENAI_MODEL         = gpt-4o-mini
+# Environment variables (Render Dashboard):
+#   SELF_HEALTH_URL    = https://function-runner.onrender.com/health
+#   KEEPALIVE_INTERVAL = 30
+#   ENABLE_KEEPALIVE   = true
+#   MEMORY_BASE_URL    = https://dave-runner.onrender.com
+#   MEMORY_API_KEY     = <secret key if needed>
+#   OPENAI_API_KEY     = <optional>
+#   OPENAI_MODEL       = gpt-4o-mini
+#   SERVICE_NAME       = function-runner
 
 import os, json, time, threading, requests
-from typing import Any, Dict, Optional, Tuple
 from flask import Flask, request, jsonify
+from typing import Any, Dict, Optional, Tuple
 
-# ---------- Config ----------
+# ---------- Configuration ----------
 OPENAI_API_KEY   = (os.getenv("OPENAI_API_KEY") or "").strip()
-OPENAI_MODEL     = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+OPENAI_MODEL     = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 MEMORY_BASE_URL  = (os.getenv("MEMORY_BASE_URL") or "").rstrip("/")
 MEMORY_API_KEY   = (os.getenv("MEMORY_API_KEY") or "").strip()
 
@@ -30,7 +31,7 @@ except Exception:
 app = Flask(__name__)
 BOOT_TS = int(time.time())
 
-# ---------- Helpers ----------
+# ---------- Utility Helpers ----------
 def jok(data: Any = None, **extra):
     p = {"ok": True}
     if data is not None:
@@ -52,72 +53,57 @@ def get_json() -> Tuple[Optional[dict], Optional[Tuple[Any, int]]]:
     except Exception:
         return None, jfail("Invalid or missing JSON body", 400)
 
-def mem_enabled(): 
-    return bool(MEMORY_BASE_URL and MEMORY_API_KEY)
+def mem_enabled():
+    return bool(MEMORY_BASE_URL)
 
-def mem_headers(): 
-    return {"Content-Type": "application/json", "X-API-KEY": MEMORY_API_KEY}
+def mem_headers():
+    h = {"Content-Type": "application/json"}
+    if MEMORY_API_KEY:
+        h["X-API-KEY"] = MEMORY_API_KEY
+    return h
 
 def safe_upstream_json(r: requests.Response):
     try:
         return r.json()
     except Exception:
-        return {"raw": r.text[:2000], "status": r.status_code}
+        return {"raw": r.text[:1000], "status": r.status_code}
 
-# ---------- Keepalive (30s triple ping) ----------
+# ---------- Keepalive Thread ----------
 def _keepalive():
     url = os.getenv("SELF_HEALTH_URL", "").strip()
     interval = int(os.getenv("KEEPALIVE_INTERVAL", "30"))
     if not url:
         print("[KEEPALIVE] Disabled (no SELF_HEALTH_URL)")
         return
-    print(f"[KEEPALIVE] Active: triple ping to {url} every {interval}s")
+    print(f"[KEEPALIVE] Triple-ping active → {url} every {interval}s")
     while True:
         for i in range(3):
             try:
                 r = requests.get(url, timeout=10)
-                print(f"[KEEPALIVE] Ping {i+1}/3 -> {r.status_code} @ {int(time.time())}")
+                print(f"[KEEPALIVE] Ping {i+1}/3 → {r.status_code} @ {int(time.time())}")
             except Exception as e:
                 print(f"[KEEPALIVE] Error {i+1}/3: {e}")
             time.sleep(2)
         time.sleep(interval)
 
-# ---------- Triple Warmup ----------
+if os.getenv("ENABLE_KEEPALIVE", "true").lower() in ("1", "true", "yes", "on"):
+    threading.Thread(target=_keepalive, daemon=True).start()
+
+# ---------- Warmup ----------
 def _triple_warmup():
-    target = f"{MEMORY_BASE_URL}/health" if MEMORY_BASE_URL else None
-    if not target:
+    if not MEMORY_BASE_URL:
         print("[WARMUP] Skipped (no MEMORY_BASE_URL)")
         return
-    print(f"[WARMUP] Starting triple ghost ping to {target}")
+    target = f"{MEMORY_BASE_URL}/health"
+    print(f"[WARMUP] Starting triple ghost ping → {target}")
     for i in range(3):
         try:
             r = requests.get(target, timeout=5)
-            print(f"[WARMUP] Ghost ping {i+1}/3 -> {r.status_code}")
+            print(f"[WARMUP] Ghost ping {i+1}/3 → {r.status_code}")
         except Exception as e:
             print(f"[WARMUP] Ghost ping {i+1}/3 failed: {e}")
         time.sleep(3)
-    print("[WARMUP] Triple ping complete.")
-
-# ---------- Memory Warm Probe ----------
-def _warm_probe():
-    """Ping the memory API's /health endpoint before saving or getting."""
-    if not mem_enabled():
-        return
-    try:
-        target = f"{MEMORY_BASE_URL}/health"
-        r = requests.get(target, timeout=5)
-        print(f"[WARM PROBE] Memory API health -> {r.status_code}")
-    except Exception as e:
-        print(f"[WARM PROBE] Error pinging memory API: {e}")
-
-# ---------- Threads ----------
-_enable = os.getenv("ENABLE_KEEPALIVE", "true").lower()
-if _enable in ("1", "true", "yes", "on"):
-    threading.Thread(target=_keepalive, daemon=True).start()
-    print("[KEEPALIVE] Thread started")
-else:
-    print("[KEEPALIVE] Disabled by env var")
-
+    print("[WARMUP] Complete.")
 threading.Thread(target=_triple_warmup, daemon=True).start()
 
 # ---------- Routes ----------
@@ -138,16 +124,15 @@ def health():
         "uptime_seconds": int(time.time()) - BOOT_TS,
         "openai_enabled": bool(_openai_client),
         "memory_api_enabled": mem_enabled(),
+        "service": "function-runner"
     })
 
 @app.route("/chat", methods=["POST"])
 def chat():
     d, err = get_json()
-    if err:
-        return err
+    if err: return err
     msg = (d.get("message") or "").strip()
-    if not msg:
-        return jfail("message is required", 400)
+    if not msg: return jfail("message required", 400)
     return jok({"reply": f"🪞 Echo: {msg[:2000]}", "ts": int(time.time())})
 
 @app.route("/openai/chat", methods=["POST"])
@@ -155,22 +140,18 @@ def openai_chat():
     if not _openai_client:
         return jfail("OpenAI not configured", 503)
     d, err = get_json()
-    if err:
-        return err
+    if err: return err
     msg = (d.get("message") or "").strip()
-    sys = (d.get("system") or "You are a concise, helpful assistant.").strip()
-    model = (d.get("model") or OPENAI_MODEL).strip() or OPENAI_MODEL
+    sys = (d.get("system") or "You are a concise, factual assistant.").strip()
+    model = (d.get("model") or OPENAI_MODEL).strip()
     temperature = float(d.get("temperature") or 0.2)
     max_tokens = min(int(d.get("max_tokens") or 512), 4096)
-    if not msg:
-        return jfail("message is required", 400)
+    if not msg: return jfail("message required", 400)
+
     try:
         resp = _openai_client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": msg}
-            ],
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": msg}],
             temperature=temperature,
             max_tokens=max_tokens,
         )
@@ -179,26 +160,22 @@ def openai_chat():
     except Exception as e:
         return jfail(f"OpenAI error: {e}", 502)
 
-# ---------- Memory passthroughs ----------
+# ---------- Memory Routes ----------
 @app.route("/memory/save", methods=["POST"])
 def memory_save():
     if not mem_enabled():
         return jfail("Memory API not configured", 503)
     d, err = get_json()
-    if err:
-        return err
-
-    _warm_probe()  # ensure memory API is warm
-
+    if err: return err
     try:
-        r = requests.post(f"{MEMORY_BASE_URL}/save_memory",
+        r = requests.post(f"{MEMORY_BASE_URL}/memory/save",
                           headers=mem_headers(),
                           data=json.dumps(d),
                           timeout=30)
         return jsonify({
             "ok": r.ok,
             "upstream_status": r.status_code,
-            "data": safe_upstream_json(r),
+            "data": safe_upstream_json(r)
         }), (200 if r.ok else 502)
     except Exception as e:
         return jfail(f"Upstream error: {e}", 502)
@@ -208,25 +185,21 @@ def memory_get():
     if not mem_enabled():
         return jfail("Memory API not configured", 503)
     d, err = get_json()
-    if err:
-        return err
-
-    _warm_probe()  # ensure DB pool hot before query
-
+    if err: return err
     try:
-        r = requests.post(f"{MEMORY_BASE_URL}/get_memory",
+        r = requests.post(f"{MEMORY_BASE_URL}/memory/get",
                           headers=mem_headers(),
                           data=json.dumps(d),
-                          timeout=12)
+                          timeout=15)
         return jsonify({
             "ok": r.ok,
             "upstream_status": r.status_code,
-            "data": safe_upstream_json(r),
+            "data": safe_upstream_json(r)
         }), (200 if r.ok else 502)
     except Exception as e:
         return jfail(f"Upstream error: {e}", 502)
 
-# ---------- Local dev ----------
+# ---------- Local Run ----------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=True)
